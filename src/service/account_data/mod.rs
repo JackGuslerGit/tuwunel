@@ -13,6 +13,7 @@ use ruma::{
 	serde::Raw,
 };
 use serde::Deserialize;
+use serde_json::json;
 use tuwunel_core::{
 	Err, Result, at, err, implement,
 	utils::{ReadyExt, result::LogErr, stream::TryIgnore},
@@ -80,6 +81,25 @@ pub async fn update(
 	}
 
 	Ok(())
+}
+
+/// MSC3391: replace the stored event with a tombstone whose content is
+/// `{}`. Delta sync surfaces the empty content so clients can apply the
+/// deletion; initial sync and GET treat the tombstone as not-present.
+#[implement(Service)]
+pub async fn delete(
+	&self,
+	room_id: Option<&RoomId>,
+	user_id: &UserId,
+	event_type: RoomAccountDataEventType,
+) -> Result {
+	let tombstone = json!({
+		"type": event_type.to_string(),
+		"content": {},
+	});
+
+	self.update(room_id, user_id, event_type, &tombstone)
+		.await
 }
 
 /// Searches the room account data for a specific kind.
@@ -160,6 +180,29 @@ pub fn changes_since<'a>(
 			.log_err()
 		})
 		.ignore_err()
+}
+
+/// MSC4025: erase all account data for a user in the given namespace
+/// (global if `room_id` is `None`, otherwise a single room). Mirrors
+/// `threads::delete_all_rooms_threads`: prefix-scan the keys and
+/// remove each.
+#[implement(Service)]
+pub async fn erase_user(&self, user_id: &UserId, room_id: Option<&RoomId>) {
+	let prefix = (room_id, user_id, Interfix);
+
+	self.db
+		.roomuserdataid_accountdata
+		.keys_prefix_raw(&prefix)
+		.ignore_err()
+		.ready_for_each(|key| self.db.roomuserdataid_accountdata.remove(key))
+		.await;
+
+	self.db
+		.roomusertype_roomuserdataid
+		.keys_prefix_raw(&prefix)
+		.ignore_err()
+		.ready_for_each(|key| self.db.roomusertype_roomuserdataid.remove(key))
+		.await;
 }
 
 /// Returns all changes to the account data that happened after `since`.

@@ -4,6 +4,7 @@ use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, EventId, UserId,
 	events::{
 		TimelineEventType,
+		receipt::ReceiptThread,
 		room::{
 			encrypted::Relation,
 			member::{MembershipState, RoomMemberEventContent},
@@ -160,20 +161,27 @@ where
 	let next_count2 = self.services.globals.next_count();
 
 	// Mark as read first so the sending client doesn't get a notification even if
-	// appending fails
+	// appending fails. Route through the dispatcher so per-thread counts are
+	// also cleared; the sender's own send subsumes any thread receipt.
 	self.services
 		.read_receipt
-		.private_read_set(pdu.room_id(), pdu.sender(), *next_count2);
+		.private_read_set(pdu.room_id(), pdu.sender(), *next_count2, &ReceiptThread::Unthreaded)
+		.await;
 
 	self.services
 		.pusher
-		.reset_notification_counts(pdu.sender(), pdu.room_id());
+		.reset_notification_counts_for_thread(
+			pdu.sender(),
+			pdu.room_id(),
+			&ReceiptThread::Unthreaded,
+		)
+		.await;
 
 	let count = PduCount::Normal(*next_count1);
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
 
 	// Insert pdu
-	self.append_pdu_json(&pdu_id, pdu, &pdu_json, count);
+	self.append_pdu_json(&pdu_id, pdu, &pdu_json);
 
 	drop(insert_lock);
 
@@ -234,12 +242,7 @@ async fn append_pdu_effects(
 		},
 		| TimelineEventType::SpaceChild =>
 			if let Some(_state_key) = pdu.state_key() {
-				self.services
-					.spaces
-					.roomid_spacehierarchy_cache
-					.lock()
-					.await
-					.remove(pdu.room_id());
+				self.services.spaces.cache_evict(pdu.room_id());
 			},
 		| TimelineEventType::RoomMember => {
 			if let Some(state_key) = pdu.state_key() {
@@ -265,7 +268,7 @@ async fn append_pdu_effects(
 					.state_cache
 					.update_membership(
 						pdu.room_id(),
-						target_user_id,
+						&target_user_id,
 						content,
 						pdu.sender(),
 						stripped_state,
@@ -311,7 +314,7 @@ async fn append_pdu_effects(
 
 	if let Ok(content) = pdu.get_content::<ExtractRelatesTo>() {
 		match content.relates_to {
-			| Relation::Reply { in_reply_to } => {
+			| Relation::Reply(ruma::events::relation::Reply { in_reply_to }) => {
 				// We need to do it again here, because replies don't have
 				// event_id as a top level field
 				if let Ok(related_pducount) = self.get_pdu_count(&in_reply_to.event_id).await {
@@ -334,14 +337,8 @@ async fn append_pdu_effects(
 }
 
 #[implement(super::Service)]
-fn append_pdu_json(
-	&self,
-	pdu_id: &RawPduId,
-	pdu: &PduEvent,
-	json: &CanonicalJsonObject,
-	count: PduCount,
-) {
-	debug_assert!(matches!(count, PduCount::Normal(_)), "PduCount not Normal");
+fn append_pdu_json(&self, pdu_id: &RawPduId, pdu: &PduEvent, json: &CanonicalJsonObject) {
+	debug_assert!(matches!(pdu_id.pdu_count(), PduCount::Normal(_)), "PduCount not Normal");
 
 	self.db.pduid_pdu.raw_put(pdu_id, Json(json));
 
@@ -352,4 +349,9 @@ fn append_pdu_json(
 	self.db
 		.eventid_outlierpdu
 		.remove(pdu.event_id.as_bytes());
+
+	let ts = u64::from(pdu.origin_server_ts);
+	self.db
+		.roomid_ts_pducount
+		.put_raw((pdu.room_id(), ts), pdu_id.count());
 }

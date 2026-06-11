@@ -1,5 +1,4 @@
 use axum::extract::State;
-use axum_client_ip::InsecureClientIp;
 use futures::{FutureExt, StreamExt, TryFutureExt, future::join3, stream::FuturesUnordered};
 use ruma::{
 	OwnedServerName, RoomId, UserId,
@@ -16,7 +15,7 @@ use tuwunel_core::{
 };
 use tuwunel_service::Services;
 
-use crate::{Ruma, RumaResponse};
+use crate::{ClientIp, Ruma, RumaResponse};
 
 /// # `GET /_matrix/client/unstable/im.nheko.summary/rooms/{roomIdOrAlias}/summary`
 ///
@@ -29,10 +28,10 @@ use crate::{Ruma, RumaResponse};
 /// An implementation of [MSC3266](https://github.com/matrix-org/matrix-spec-proposals/pull/3266)
 pub(crate) async fn get_room_summary_legacy(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<get_summary::v1::Request>,
 ) -> Result<RumaResponse<get_summary::v1::Response>> {
-	get_room_summary(State(services), InsecureClientIp(client), body)
+	get_room_summary(State(services), ClientIp(client), body)
 		.boxed()
 		.await
 		.map(RumaResponse)
@@ -46,7 +45,7 @@ pub(crate) async fn get_room_summary_legacy(
 #[tracing::instrument(skip_all, fields(%client), name = "room_summary")]
 pub(crate) async fn get_room_summary(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<get_summary::v1::Request>,
 ) -> Result<get_summary::v1::Response> {
 	let (room_id, servers) = services
@@ -231,7 +230,15 @@ async fn remote_room_summary_hierarchy_response(
 		})
 		.collect();
 
-	while let Some(Ok(response)) = requests.next().await {
+	while let Some(result) = requests.next().await {
+		let response = match result {
+			| Ok(response) => response,
+			| Err(e) => {
+				debug_warn!(?e, "Failed to fetch room hierarchy over federation");
+				continue;
+			},
+		};
+
 		trace!("{response:?}");
 		let room = response.room.clone();
 		let summary = &room.summary;

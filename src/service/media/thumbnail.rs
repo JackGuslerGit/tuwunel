@@ -5,16 +5,17 @@
 //! inclusion of dependencies and nulls out results using the existing interface
 //! when not featured.
 
-use std::{cmp, num::Saturating as Sat};
+use std::{cmp, num::Saturating as Sat, sync::Arc, time::Duration};
 
+use futures::{StreamExt, pin_mut};
 use ruma::{Mxc, UInt, UserId, http_headers::ContentDisposition, media::Method};
-use tokio::{
-	fs,
-	io::{AsyncReadExt, AsyncWriteExt},
+use tokio::sync::Notify;
+use tuwunel_core::{
+	Err, Result, checked, err, implement,
+	utils::{result::LogDebugErr, stream::IterStream},
 };
-use tuwunel_core::{Result, checked, err, implement};
 
-use super::{FileMeta, data::Metadata};
+use super::{Media, data::Metadata};
 
 /// Dimension specification for a thumbnail.
 #[derive(Debug)]
@@ -26,10 +27,14 @@ pub struct Dim {
 
 impl super::Service {
 	/// Uploads or replaces a file thumbnail.
+	#[tracing::instrument(
+		level = "debug",
+		ret(level = "debug")
+		skip(self, file),
+	)]
 	pub async fn upload_thumbnail(
 		&self,
 		mxc: &Mxc<'_>,
-		user: Option<&UserId>,
 		content_disposition: Option<&ContentDisposition>,
 		content_type: Option<&str>,
 		dim: &Dim,
@@ -37,13 +42,95 @@ impl super::Service {
 	) -> Result {
 		let key =
 			self.db
-				.create_file_metadata(mxc, user, dim, content_disposition, content_type)?;
+				.create_file_metadata(mxc, None, dim, content_disposition, content_type)?;
 
 		//TODO: Dangling metadata in database if creation fails
-		let mut f = self.create_media_file(&key).await?;
-		f.write_all(file).await?;
-
+		self.create_media_file(&key, file).await?;
 		Ok(())
+	}
+
+	#[tracing::instrument(
+		level = "debug",
+		err(level = "debug")
+		skip(self),
+	)]
+	pub async fn get_or_fetch_thumbnail(
+		&self,
+		mxc: &Mxc<'_>,
+		dim: &Dim,
+		timeout_ms: Duration,
+		user: &UserId,
+	) -> Result<Media> {
+		if let Ok(media) = self
+			.get_thumbnail(mxc, dim, Some(timeout_ms))
+			.await
+		{
+			return Ok(media);
+		}
+
+		if self
+			.services
+			.globals
+			.server_is_ours(mxc.server_name)
+		{
+			return Err!(Request(NotFound("Local thumbnail not found.")));
+		}
+
+		let lock = self.federation_mutex.lock(&mxc.to_string()).await;
+
+		if self
+			.db
+			.file_metadata_exists(mxc, &dim.normalized())
+			.await
+		{
+			drop(lock);
+			return self.get_thumbnail(mxc, dim, None).await;
+		}
+
+		self.fetch_remote_thumbnail(mxc, None, timeout_ms, dim)
+			.await
+	}
+
+	/// Download a thumbnail and wait up to a timeout_ms if it is pending.
+	#[tracing::instrument(
+		level = "debug",
+		err(level = "debug")
+		skip(self),
+	)]
+	pub async fn get_thumbnail(
+		&self,
+		mxc: &Mxc<'_>,
+		dim: &Dim,
+		timeout_duration: Option<Duration>,
+	) -> Result<Media> {
+		if let Ok(meta) = self.get_stored_thumbnail(mxc, dim).await {
+			return Ok(meta);
+		}
+
+		let Some(timeout_duration) = timeout_duration else {
+			return Err!(Request(NotFound("Media thumbnail not found.")));
+		};
+
+		let Ok(_pending) = self.db.search_pending_mxc(mxc).await else {
+			return Err!(Request(NotFound("Media thumbnail not found.")));
+		};
+
+		let notifier = self
+			.mxc_state
+			.notifiers
+			.lock()?
+			.entry(mxc.to_string().into())
+			.or_insert_with(|| Arc::new(Notify::new()))
+			.clone();
+
+		if tokio::time::timeout(timeout_duration, notifier.notified())
+			.await
+			.is_err()
+		{
+			return Err!(Request(NotYetUploaded("Media has not been uploaded yet")));
+		}
+
+		self.get_stored_thumbnail(mxc, dim).await
 	}
 
 	/// Downloads a file's thumbnail.
@@ -59,39 +146,52 @@ impl super::Service {
 	///
 	/// For width,height <= 96 the server uses another thumbnailing algorithm
 	/// which crops the image afterwards.
-	#[tracing::instrument(skip(self), name = "thumbnail", level = "debug")]
-	pub async fn get_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim) -> Result<Option<FileMeta>> {
+	#[tracing::instrument(
+		name = "thumbnail",
+		level = "debug",
+		err(level = "trace")
+		skip(self),
+	)]
+	pub async fn get_stored_thumbnail(&self, mxc: &Mxc<'_>, dim: &Dim) -> Result<Media> {
 		// 0, 0 because that's the original file
 		let dim = dim.normalized();
 
-		match self.db.search_file_metadata(mxc, &dim).await {
-			| Ok(metadata) => self.get_thumbnail_saved(metadata).await,
-			| _ => match self
-				.db
-				.search_file_metadata(mxc, &Dim::default())
-				.await
-			{
-				| Ok(metadata) =>
-					self.get_thumbnail_generate(mxc, &dim, metadata)
-						.await,
-				| _ => Ok(None),
-			},
+		if let Ok(metadata) = self.db.search_file_metadata(mxc, &dim).await {
+			return self.get_thumbnail_saved(metadata).await;
 		}
+
+		let metadata = self
+			.db
+			.search_file_metadata(mxc, &Dim::default())
+			.await?;
+
+		self.get_thumbnail_generate(mxc, &dim, metadata)
+			.await
 	}
 }
 
 /// Using saved thumbnail
 #[implement(super::Service)]
-#[tracing::instrument(name = "saved", level = "debug", skip(self, data))]
-async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Option<FileMeta>> {
-	let mut content = Vec::new();
-	let path = self.get_media_file(&data.key);
-	fs::File::open(path)
-		.await?
-		.read_to_end(&mut content)
-		.await?;
+#[tracing::instrument(name = "saved", level = "debug", skip_all)]
+async fn get_thumbnail_saved(&self, data: Metadata) -> Result<Media> {
+	let path = self.get_media_name_sha256(&data.key);
+	let fetch = self
+		.storage_providers()
+		.stream()
+		.filter_map(async |provider| {
+			provider
+				.get(path.as_str())
+				.await
+				.log_debug_err()
+				.ok()
+		});
 
-	Ok(Some(into_filemeta(data, content)))
+	pin_mut!(fetch);
+	let Some(bytes) = fetch.next().await else {
+		return Err!(Request(NotFound("Media thumbnail not found.")));
+	};
+
+	Ok(into_media(data, bytes.to_vec()))
 }
 
 /// Generate a thumbnail
@@ -103,21 +203,18 @@ async fn get_thumbnail_generate(
 	mxc: &Mxc<'_>,
 	dim: &Dim,
 	data: Metadata,
-) -> Result<Option<FileMeta>> {
-	let mut content = Vec::new();
-	let path = self.get_media_file(&data.key);
-	fs::File::open(path)
-		.await?
-		.read_to_end(&mut content)
-		.await?;
+) -> Result<Media> {
+	let Ok(media) = self.get_stored(mxc).await else {
+		return Err!("Could not find original media.");
+	};
 
-	let Ok(image) = image::load_from_memory(&content) else {
+	let Ok(image) = image::load_from_memory(&media.content) else {
 		// Couldn't parse file to generate thumbnail, send original
-		return Ok(Some(into_filemeta(data, content)));
+		return Ok(into_media(data, media.content));
 	};
 
 	if dim.width > image.width() || dim.height > image.height() {
-		return Ok(Some(into_filemeta(data, content)));
+		return Ok(into_media(data, media.content));
 	}
 
 	let mut thumbnail_bytes = Vec::new();
@@ -136,10 +233,10 @@ async fn get_thumbnail_generate(
 		data.content_type.as_deref(),
 	)?;
 
-	let mut f = self.create_media_file(&thumbnail_key).await?;
-	f.write_all(&thumbnail_bytes).await?;
+	self.create_media_file(&thumbnail_key, &thumbnail_bytes)
+		.await?;
 
-	Ok(Some(into_filemeta(data, thumbnail_bytes)))
+	Ok(into_media(data, thumbnail_bytes))
 }
 
 #[cfg(not(feature = "media_thumbnail"))]
@@ -150,7 +247,7 @@ async fn get_thumbnail_generate(
 	_mxc: &Mxc<'_>,
 	_dim: &Dim,
 	data: Metadata,
-) -> Result<Option<FileMeta>> {
+) -> Result<Media> {
 	self.get_thumbnail_saved(data).await
 }
 
@@ -175,9 +272,9 @@ fn thumbnail_generate(
 	Ok(thumbnail)
 }
 
-fn into_filemeta(data: Metadata, content: Vec<u8>) -> FileMeta {
-	FileMeta {
-		content: Some(content),
+fn into_media(data: Metadata, content: Vec<u8>) -> Media {
+	Media {
+		content,
 		content_type: data.content_type,
 		content_disposition: data.content_disposition,
 	}

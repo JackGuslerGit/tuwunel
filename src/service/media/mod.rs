@@ -1,4 +1,3 @@
-pub mod blurhash;
 mod data;
 pub(super) mod migrations;
 mod preview;
@@ -14,29 +13,33 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, pin_mut};
 use http::StatusCode;
 use ruma::{
 	Mxc, OwnedMxcUri, OwnedUserId, UserId,
-	api::client::error::{ErrorKind, RetryAfter},
+	api::error::{ErrorKind, RetryAfter},
 	http_headers::ContentDisposition,
 };
-use tokio::{
-	fs,
-	io::{AsyncReadExt, AsyncWriteExt, BufReader},
-	sync::Notify,
-};
+use tokio::{fs, sync::Notify};
 use tuwunel_core::{
-	Err, Error, Result, debug, debug_error, debug_info, debug_warn, err, error, trace,
-	utils::{self, MutexMap, time::now_millis},
+	Err, Error, Result, debug, debug_error, debug_info, debug_warn, err, trace,
+	utils::{
+		self, BoolExt, MutexMap,
+		result::LogDebugErr,
+		stream::{IterStream, TryReadyExt},
+		time::now_millis,
+	},
 	warn,
 };
+use url::Url;
 
 use self::data::{Data, Metadata};
 pub use self::thumbnail::Dim;
+use crate::storage::Provider;
 
 #[derive(Debug)]
-pub struct FileMeta {
-	pub content: Option<Vec<u8>>,
+pub struct Media {
+	pub content: Vec<u8>,
 	pub content_type: Option<String>,
 	pub content_disposition: Option<ContentDisposition>,
 }
@@ -53,6 +56,7 @@ pub struct Service {
 	pub(super) db: Data,
 	services: Arc<crate::services::OnceServices>,
 	url_preview_mutex: MutexMap<String, ()>,
+	federation_mutex: MutexMap<String, ()>,
 	mxc_state: MXCState,
 }
 
@@ -65,6 +69,9 @@ pub const CACHE_CONTROL_IMMUTABLE: &str = "private,max-age=31536000,immutable";
 /// Default cross-origin resource policy.
 pub const CORP_CROSS_ORIGIN: &str = "cross-origin";
 
+/// Validity window for a presigned media download redirect (MSC3860).
+const REDIRECT_TTL: Duration = Duration::from_mins(5);
+
 #[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
@@ -72,17 +79,12 @@ impl crate::Service for Service {
 			db: Data::new(args.db),
 			services: args.services.clone(),
 			url_preview_mutex: MutexMap::new(),
+			federation_mutex: MutexMap::new(),
 			mxc_state: MXCState {
 				notifiers: Mutex::new(HashMap::new()),
 				ratelimiter: Mutex::new(HashMap::new()),
 			},
 		}))
-	}
-
-	async fn worker(self: Arc<Self>) -> Result {
-		self.create_media_dir().await?;
-
-		Ok(())
 	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
@@ -120,7 +122,9 @@ impl Service {
 				*tokens = new_tokens - 1.0;
 			} else {
 				return Err(Error::Request(
-					ErrorKind::LimitExceeded { retry_after: None },
+					ErrorKind::LimitExceeded(ruma::api::error::LimitExceededErrorData {
+						retry_after: None,
+					}),
 					"Too many pending media creation requests.".into(),
 					StatusCode::TOO_MANY_REQUESTS,
 				));
@@ -135,9 +139,9 @@ impl Service {
 		if current_uploads >= max_uploads {
 			let retry_after = earliest_expiration.saturating_sub(now_millis());
 			return Err(Error::Request(
-				ErrorKind::LimitExceeded {
+				ErrorKind::LimitExceeded(ruma::api::error::LimitExceededErrorData {
 					retry_after: Some(RetryAfter::Delay(Duration::from_millis(retry_after))),
-				},
+				}),
 				"Maximum number of pending media uploads reached.".into(),
 				StatusCode::TOO_MANY_REQUESTS,
 			));
@@ -182,15 +186,8 @@ impl Service {
 		self.db.remove_pending_mxc(mxc);
 
 		let mxc_uri: OwnedMxcUri = mxc.to_string().into();
-		if let Some(notifier) = self
-			.mxc_state
-			.notifiers
-			.lock()?
-			.get(&mxc_uri)
-			.cloned()
-		{
+		if let Some(notifier) = self.mxc_state.notifiers.lock()?.remove(&mxc_uri) {
 			notifier.notify_waiters();
-			self.mxc_state.notifiers.lock()?.remove(&mxc_uri);
 		}
 
 		Ok(())
@@ -215,19 +212,17 @@ impl Service {
 		)?;
 
 		//TODO: Dangling metadata in database if creation fails
-		let mut f = self.create_media_file(&key).await?;
-		f.write_all(file).await?;
-
-		Ok(())
+		self.create_media_file(&key, file).await
 	}
 
 	/// Deletes a file in the database and from the media directory via an MXC
+	#[tracing::instrument(level = "trace", skip(self))]
 	pub async fn delete(&self, mxc: &Mxc<'_>) -> Result {
 		match self.db.search_mxc_metadata_prefix(mxc).await {
 			| Ok(keys) => {
 				for key in keys {
 					trace!(?mxc, "MXC Key: {key:?}");
-					debug_info!(?mxc, "Deleting from filesystem");
+					debug_info!(?mxc, "Deleting from storage provider");
 
 					if let Err(e) = self.remove_media_file(&key).await {
 						debug_error!(?mxc, "Failed to remove media file: {e}");
@@ -250,6 +245,7 @@ impl Service {
 	/// Deletes all media by the specified user
 	///
 	/// currently, this is only practical for local users
+	#[tracing::instrument(level = "trace", skip(self))]
 	pub async fn delete_from_user(&self, user: &UserId) -> Result<usize> {
 		let mxcs = self.db.get_all_user_mxcs(user).await;
 		let mut deletion_count: usize = 0;
@@ -261,13 +257,19 @@ impl Service {
 				continue;
 			};
 
-			debug_info!(%deletion_count, "Deleting MXC {mxc} by user {user} from database and filesystem");
+			debug_info!(
+				%deletion_count,
+				"Deleting MXC {mxc} by user {user} from database and filesystem",
+			);
 			match self.delete(&mxc).await {
 				| Ok(()) => {
 					deletion_count = deletion_count.saturating_add(1);
 				},
 				| Err(e) => {
-					debug_error!(%deletion_count, "Failed to delete {mxc} from user {user}, ignoring error: {e}");
+					debug_error!(
+						%deletion_count,
+						"Failed to delete {mxc} from user {user}, ignoring error: {e}"
+					);
 				},
 			}
 		}
@@ -275,93 +277,146 @@ impl Service {
 		Ok(deletion_count)
 	}
 
-	/// Downloads a file.
-	pub async fn get(&self, mxc: &Mxc<'_>) -> Result<Option<FileMeta>> {
-		match self
+	/// Get file from local storage or make a federation request if it
+	/// originates remotely.
+	#[tracing::instrument(
+		level = "debug",
+		err(level = "debug")
+		skip(self),
+	)]
+	pub async fn get_or_fetch(&self, mxc: &Mxc<'_>, timeout_ms: Duration) -> Result<Media> {
+		if let Ok(media) = self.get(mxc, Some(timeout_ms)).await {
+			return Ok(media);
+		}
+
+		if self
+			.services
+			.globals
+			.server_is_ours(mxc.server_name)
+		{
+			return Err!(Request(NotFound("Local media not found.")));
+		}
+
+		let lock = self.federation_mutex.lock(&mxc.to_string()).await;
+
+		if self
+			.db
+			.file_metadata_exists(mxc, &Dim::default())
+			.await
+		{
+			drop(lock);
+			return self.get(mxc, None).await;
+		}
+
+		self.fetch_remote_content(mxc, None, timeout_ms)
+			.await
+	}
+
+	/// Get file from local storage while waiting up to a timeout_ms if it is
+	/// pending.
+	#[tracing::instrument(
+		level = "debug",
+		err(level = "trace")
+		skip(self),
+	)]
+	pub async fn get(&self, mxc: &Mxc<'_>, timeout: Option<Duration>) -> Result<Media> {
+		if let Ok(meta) = self.get_stored(mxc).await {
+			return Ok(meta);
+		}
+
+		let Some(timeout) = timeout else {
+			return Err!(Request(NotFound("Media not found.")));
+		};
+
+		let Ok(_pending) = self.db.search_pending_mxc(mxc).await else {
+			return Err!(Request(NotFound("Media not found.")));
+		};
+
+		let notifier = self
+			.mxc_state
+			.notifiers
+			.lock()?
+			.entry(mxc.to_string().into())
+			.or_insert_with(|| Arc::new(Notify::new()))
+			.clone();
+
+		if tokio::time::timeout(timeout, notifier.notified())
+			.await
+			.is_err()
+		{
+			return Err!(Request(NotYetUploaded("Media has not been uploaded yet")));
+		}
+
+		self.get_stored(mxc).await
+	}
+
+	/// Get file from local storage.
+	#[tracing::instrument(level = "debug", skip(self))]
+	pub async fn get_stored(&self, mxc: &Mxc<'_>) -> Result<Media> {
+		let meta = self
 			.db
 			.search_file_metadata(mxc, &Dim::default())
-			.await
-		{
-			| Ok(Metadata { content_disposition, content_type, key }) => {
-				let mut content = Vec::with_capacity(8192);
-				let path = self.get_media_file(&key);
-				BufReader::new(fs::File::open(path).await?)
-					.read_to_end(&mut content)
-					.await?;
+			.await;
 
-				Ok(Some(FileMeta {
-					content: Some(content),
-					content_type,
-					content_disposition,
-				}))
-			},
-			| _ => Ok(None),
-		}
+		let Ok(Metadata { content_type, content_disposition, key }) = meta else {
+			return Err!(Request(NotFound("Media not found.")));
+		};
+
+		let path = self.get_media_name_sha256(&key);
+		let fetch = self
+			.storage_providers()
+			.stream()
+			.filter_map(async |provider| {
+				provider
+					.get(path.as_str())
+					.await
+					.log_debug_err()
+					.ok()
+			});
+
+		pin_mut!(fetch);
+		let Some(bytes) = fetch.next().await else {
+			return Err!(Request(NotFound("Media not found.")));
+		};
+
+		Ok(Media {
+			content: bytes.to_vec(),
+			content_type,
+			content_disposition,
+		})
 	}
 
-	/// Download a file and wait up to a timeout_ms if it is pending.
-	pub async fn get_with_timeout(
-		&self,
-		mxc: &Mxc<'_>,
-		timeout_duration: Duration,
-	) -> Result<Option<FileMeta>> {
-		if let Some(meta) = self.get(mxc).await? {
-			return Ok(Some(meta));
+	/// Presigned redirect URL for locally-stored media (MSC3860).
+	///
+	/// Returns the first configured provider's signed URL for the object, or
+	/// `None` when redirects are disabled, the media is unknown, or no provider
+	/// can presign (filesystem-only media).
+	#[tracing::instrument(level = "debug", skip(self))]
+	pub async fn redirect_url(&self, mxc: &Mxc<'_>, dim: &Dim) -> Result<Option<Url>> {
+		if !self.services.config.media_allow_redirect {
+			return Ok(None);
 		}
 
-		let Ok(_pending) = self.db.search_pending_mxc(mxc).await else {
+		let Ok(Metadata { key, .. }) = self.db.search_file_metadata(mxc, dim).await else {
 			return Ok(None);
 		};
 
-		let notifier = self
-			.mxc_state
-			.notifiers
-			.lock()?
-			.entry(mxc.to_string().into())
-			.or_insert_with(|| Arc::new(Notify::new()))
-			.clone();
+		let path = self.get_media_name_sha256(&key);
+		let urls = self
+			.storage_providers()
+			.stream()
+			.filter_map(async |provider| {
+				provider
+					.signed_get_url(path.as_str(), REDIRECT_TTL)
+					.await
+					.log_debug_err()
+					.ok()
+					.flatten()
+			});
 
-		if tokio::time::timeout(timeout_duration, notifier.notified())
-			.await
-			.is_err()
-		{
-			return Err!(Request(NotYetUploaded("Media has not been uploaded yet")));
-		}
+		pin_mut!(urls);
 
-		self.get(mxc).await
-	}
-
-	/// Download a thumbnail and wait up to a timeout_ms if it is pending.
-	pub async fn get_thumbnail_with_timeout(
-		&self,
-		mxc: &Mxc<'_>,
-		dim: &Dim,
-		timeout_duration: Duration,
-	) -> Result<Option<FileMeta>> {
-		if let Some(meta) = self.get_thumbnail(mxc, dim).await? {
-			return Ok(Some(meta));
-		}
-
-		let Ok(_pending) = self.db.search_pending_mxc(mxc).await else {
-			return Ok(None);
-		};
-
-		let notifier = self
-			.mxc_state
-			.notifiers
-			.lock()?
-			.entry(mxc.to_string().into())
-			.or_insert_with(|| Arc::new(Notify::new()))
-			.clone();
-
-		if tokio::time::timeout(timeout_duration, notifier.notified())
-			.await
-			.is_err()
-		{
-			return Err!(Request(NotYetUploaded("Media has not been uploaded yet")));
-		}
-
-		self.get_thumbnail(mxc, dim).await
+		Ok(urls.next().await)
 	}
 
 	/// Gets all the MXC URIs in our media database
@@ -406,13 +461,13 @@ impl Service {
 		Ok(mxcs)
 	}
 
-	/// Deletes all remote only media files in the given at or after
-	/// time/duration. Returns a usize with the amount of media files deleted.
-	pub async fn delete_all_remote_media_at_after_time(
+	/// Deletes all media files before or after the given time. Returns a usize
+	/// with the number of media files deleted.
+	pub async fn delete_range(
 		&self,
 		time: SystemTime,
-		before: bool,
-		after: bool,
+		older_than: bool,
+		newer_than: bool,
 		yes_i_want_to_delete_local_media: bool,
 	) -> Result<usize> {
 		let all_keys = self.db.get_all_media_keys().await;
@@ -450,41 +505,47 @@ impl Service {
 				continue;
 			}
 
-			let path = self.get_media_file(&key);
-
-			let file_metadata = match fs::metadata(path.clone()).await {
-				| Ok(file_metadata) => file_metadata,
-				| Err(e) => {
-					error!(
-						"Failed to obtain file metadata for MXC {mxc} at file path \
-						 \"{path:?}\", skipping: {e}"
-					);
-					continue;
-				},
-			};
-
-			trace!(%mxc, ?path, "File metadata: {file_metadata:?}");
-
-			let file_created_at = match file_metadata.modified() {
-				| Ok(value) => value,
-				| Err(err) => {
-					error!("Could not delete MXC {mxc} at path {path:?}: {err:?}. Skipping...");
-					continue;
-				},
+			let file_created_at = if let Some(file_metadata) = self
+				.storage_providers()
+				.stream()
+				.filter_map(async |provider| {
+					let path = self.get_media_name_sha256(&key);
+					match provider.head(&path).await {
+						| Ok(file_metadata) => {
+							trace!(%mxc, ?path, "Provider file metadata: {file_metadata:?}");
+							Some(file_metadata)
+						},
+						| Err(e) => {
+							debug_warn!(
+								"Failed to obtain {:?} file metadata for MXC {mxc} at file path \
+								 {path:?}\", skipping: {e}",
+								provider.name,
+							);
+							None
+						},
+					}
+				})
+				.boxed()
+				.next()
+				.await
+			{
+				SystemTime::from(file_metadata.last_modified)
+			} else {
+				continue;
 			};
 
 			debug!("File created at: {file_created_at:?}");
 
-			if file_created_at >= time && before {
+			if file_created_at <= time && older_than {
 				debug!(
-					"File is within (before) user duration, pushing to list of file paths and \
-					 keys to delete."
+					"File is older than user duration, pushing to list of file paths and keys \
+					 to delete."
 				);
 				remote_mxcs.push(mxc.to_string());
-			} else if file_created_at <= time && after {
+			} else if file_created_at >= time && newer_than {
 				debug!(
-					"File is not within (after) user duration, pushing to list of file paths \
-					 and keys to delete."
+					"File is newer than user duration, pushing to list of file paths and keys \
+					 to delete."
 				);
 				remote_mxcs.push(mxc.to_string());
 			}
@@ -526,76 +587,116 @@ impl Service {
 	}
 
 	async fn remove_media_file(&self, key: &[u8]) -> Result {
-		let path = self.get_media_file(key);
-		let legacy = self.get_media_file_b64(key);
-		debug!(?key, ?path, ?legacy, "Removing media file");
+		let path = self.get_media_name_sha256(key);
+		self.storage_providers()
+			.stream()
+			.filter_map(async |provider| {
+				debug!(
+					?key, ?path, provider = ?provider.name,
+					"Deleting media file from provider",
+				);
 
-		let file_rm = fs::remove_file(&path);
-		let legacy_rm = fs::remove_file(&legacy);
-		let (file_rm, legacy_rm) = tokio::join!(file_rm, legacy_rm);
-		if let Err(e) = legacy_rm
-			&& self.services.server.config.media_compat_file_link
-		{
-			debug_error!(?key, ?legacy, "Failed to remove legacy media symlink: {e}");
-		}
-
-		Ok(file_rm?)
+				provider
+					.delete_one(&path)
+					.await
+					.log_debug_err()
+					.ok()
+			})
+			.count()
+			.map(|count| {
+				count
+					.ge(&0)
+					.into_option()
+					.ok_or_else(|| err!(Request(NotFound("Failed to remove on any provider."))))
+			})
+			.await
 	}
 
-	async fn create_media_file(&self, key: &[u8]) -> Result<fs::File> {
-		let path = self.get_media_file(key);
-		debug!(?key, ?path, "Creating media file");
+	async fn create_media_file(&self, key: &[u8], file: &[u8]) -> Result {
+		self.storage_providers()
+			.try_stream()
+			.ready_try_filter(|provider| {
+				let store_media_on_providers = &self.services.config.store_media_on_providers;
 
-		let file = fs::File::create(&path).await?;
-		if self.services.server.config.media_compat_file_link {
-			let legacy = self.get_media_file_b64(key);
-			if let Err(e) = fs::symlink(&path, &legacy).await {
-				debug_error!(
-					key = ?encode_key(key), ?path, ?legacy,
-					"Failed to create legacy media symlink: {e}"
+				store_media_on_providers.is_empty()
+					|| store_media_on_providers.contains(&provider.name)
+			})
+			.and_then(async |provider| {
+				let path = self.get_media_name_sha256(key);
+				debug!(
+					?key, ?path,
+					len = ?file.len(),
+					provider = ?provider.name,
+					"Creating media file on storage provider."
 				);
-			}
-		}
 
-		Ok(file)
+				if let Err(e) = provider
+					.put_one(path.as_str(), file.to_vec())
+					.await
+				{
+					return Err!(Database(error!(
+						?path,
+						?provider,
+						"Failed to store media on provider: {e:?}"
+					)));
+				}
+
+				Ok(1)
+			})
+			.ready_try_fold(0_usize, |a, c| Ok(a.saturating_add(c)))
+			.inspect_ok(|&uploads| assert!(uploads > 0, "Successfully saved to nowhere."))
+			.map_ok(|_| ())
+			.await
+	}
+
+	fn storage_providers(&self) -> impl Iterator<Item = &Arc<Provider>> + Send + '_ {
+		let explicit_providers = &self.services.config.media_storage_providers;
+
+		let or_all_providers = explicit_providers
+			.is_empty()
+			.then(|| self.services.storage.providers())
+			.into_iter()
+			.flatten();
+
+		explicit_providers
+			.iter()
+			.filter_map(|id| self.services.storage.provider(id).ok())
+			.chain(or_all_providers)
 	}
 
 	#[inline]
-	pub async fn get_metadata(&self, mxc: &Mxc<'_>) -> Option<FileMeta> {
+	pub async fn get_metadata(&self, mxc: &Mxc<'_>) -> Option<Metadata> {
 		self.db
 			.search_file_metadata(mxc, &Dim::default())
 			.await
-			.map(|metadata| FileMeta {
-				content_disposition: metadata.content_disposition,
-				content_type: metadata.content_type,
-				content: None,
-			})
 			.ok()
 	}
 
 	#[inline]
 	#[must_use]
-	pub fn get_media_file(&self, key: &[u8]) -> PathBuf { self.get_media_file_sha256(key) }
-
-	/// new SHA256 file name media function. requires database migrated. uses
-	/// SHA256 hash of the base64 key as the file name
-	#[must_use]
-	pub fn get_media_file_sha256(&self, key: &[u8]) -> PathBuf {
+	pub fn get_media_path_sha256(&self, key: &[u8]) -> PathBuf {
 		let mut r = self.get_media_dir();
-		// Using the hash of the base64 key as the filename
-		// This is to prevent the total length of the path from exceeding the maximum
-		// length in most filesystems
-		let digest = <sha2::Sha256 as sha2::Digest>::digest(key);
-		let encoded = encode_key(&digest);
-		r.push(encoded);
+		r.push(self.get_media_name_sha256(key));
 		r
 	}
 
-	/// old base64 file name media function
-	/// This is the old version of `get_media_file` that uses the full base64
-	/// key as the filename.
+	/// new SHA256 file name media function. requires database migrated. uses
+	/// SHA256 hash of the base64 key as the file name
+	#[inline]
 	#[must_use]
-	pub fn get_media_file_b64(&self, key: &[u8]) -> PathBuf {
+	pub fn get_media_name_sha256(&self, key: &[u8]) -> String {
+		// Using the hash of the base64 key as the filename prevents the total
+		// length of the path from exceeding the maximum length in most
+		// filesystems
+		let digest = <sha2::Sha256 as sha2::Digest>::digest(key);
+		encode_key(&digest)
+	}
+
+	/// old base64 file name media function
+	/// This is the old version of `get_media_path_sha256` that uses the full
+	/// base64 key as the filename.
+	#[must_use]
+	pub fn get_media_path_b64(&self, key: &[u8]) -> PathBuf {
 		let mut r = self.get_media_dir();
 		let encoded = encode_key(key);
 		r.push(encoded);

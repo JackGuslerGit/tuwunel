@@ -9,14 +9,14 @@ use tuwunel_database::Database;
 
 pub(crate) use crate::OnceServices;
 use crate::{
-	account_data, admin, appservice, client, config, deactivate, emergency, federation, globals,
-	key_backups,
+	account_data, admin, appservice, client, config, deactivate, emergency, federation, fetcher,
+	globals, key_backups,
 	manager::Manager,
 	media, membership, oauth, presence, pusher, registration_tokens, resolver,
 	rooms::{self, retention},
 	sending, server_keys,
 	service::{Args, Service},
-	sync, transaction_ids, uiaa, users,
+	storage, sync, transaction_ids, uiaa, users,
 };
 
 pub struct Services {
@@ -26,6 +26,7 @@ pub struct Services {
 	pub config: Arc<config::Service>,
 	pub client: Arc<client::Service>,
 	pub emergency: Arc<emergency::Service>,
+	pub fetcher: Arc<fetcher::Service>,
 	pub globals: Arc<globals::Service>,
 	pub key_backups: Arc<key_backups::Service>,
 	pub media: Arc<media::Service>,
@@ -48,6 +49,7 @@ pub struct Services {
 	pub state_accessor: Arc<rooms::state_accessor::Service>,
 	pub state_cache: Arc<rooms::state_cache::Service>,
 	pub state_compressor: Arc<rooms::state_compressor::Service>,
+	pub storage: Arc<storage::Service>,
 	pub threads: Arc<rooms::threads::Service>,
 	pub timeline: Arc<rooms::timeline::Service>,
 	pub typing: Arc<rooms::typing::Service>,
@@ -87,6 +89,7 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		client: client::Service::build(&args)?,
 		config: config::Service::build(&args)?,
 		emergency: emergency::Service::build(&args)?,
+		fetcher: fetcher::Service::build(&args)?,
 		globals: globals::Service::build(&args)?,
 		key_backups: key_backups::Service::build(&args)?,
 		media: media::Service::build(&args)?,
@@ -108,6 +111,7 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		state_accessor: rooms::state_accessor::Service::build(&args)?,
 		state_cache: rooms::state_cache::Service::build(&args)?,
 		state_compressor: rooms::state_compressor::Service::build(&args)?,
+		storage: storage::Service::build(&args)?,
 		threads: rooms::threads::Service::build(&args)?,
 		timeline: rooms::timeline::Service::build(&args)?,
 		typing: rooms::typing::Service::build(&args)?,
@@ -148,6 +152,7 @@ pub(crate) fn services(&self) -> impl Iterator<Item = Arc<dyn Service>> + Send {
 		cast!(self.client),
 		cast!(self.config),
 		cast!(self.emergency),
+		cast!(self.fetcher),
 		cast!(self.globals),
 		cast!(self.key_backups),
 		cast!(self.media),
@@ -169,6 +174,7 @@ pub(crate) fn services(&self) -> impl Iterator<Item = Arc<dyn Service>> + Send {
 		cast!(self.state_accessor),
 		cast!(self.state_cache),
 		cast!(self.state_compressor),
+		cast!(self.storage),
 		cast!(self.threads),
 		cast!(self.timeline),
 		cast!(self.typing),
@@ -199,6 +205,7 @@ pub async fn start(self: &Arc<Self>) -> Result<Arc<Self>> {
 	debug_info!("Starting services...");
 
 	super::migrations::migrations(self).await?;
+
 	self.manager
 		.lock()
 		.await
@@ -228,8 +235,11 @@ pub async fn stop(&self) {
 pub(crate) async fn interrupt(&self) {
 	debug!("Interrupting services...");
 	for service in self.services() {
-		let name = service.name();
-		trace!("Interrupting {name}");
+		trace!(
+			name = ?service.name(),
+			"Interrupting Service"
+		);
+
 		service.interrupt().await;
 	}
 }
@@ -237,6 +247,7 @@ pub(crate) async fn interrupt(&self) {
 #[implement(Services)]
 pub async fn poll(&self) -> Result {
 	if let Some(manager) = self.manager.lock().await.as_ref() {
+		trace!("Polling service manager...");
 		return manager.poll().await;
 	}
 

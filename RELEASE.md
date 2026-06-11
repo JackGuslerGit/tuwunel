@@ -1,95 +1,47 @@
-# Tuwunel 1.5.1
+# Tuwunel 1.7.1
 
-March 6, 2026
-
-### Security Fixes
-
-- A security audit of SSO/OIDC released with 1.5.0 uncovered several issues. We strongly advise everyone using SSO/OIDC upgrade to this release. Users should also note that until MSC2454 is implemented (tracked by #314) accounts will have to set a password to access functionality protected by User Interactive Authentication (e.g. when removing devices). We are deeply grateful to @outfrost and @exodrifter for their effort and professionalism as security researchers.
-
-- Case-sensitive comparisons in Room Access Control Lists were fixed by @velikopter (ruma/ruma#2358) (matrix-construct/ruma#3) (814cbc2f3).
+June 5, 2026
 
 ### New Features & Enhancements
 
-- New options for `identity_provider` configurations include: `trusted` allowing association of SSO accounts to existing matrix users (#252); `unique_id_fallbacks` to disable random-string users; `registration` to prevent registration through an IdP altogether; `check_cookie` for deployments that cannot use cookies.
+- **A new federation data-fetching service** improves reliability in rooms whose history is spread across many servers by locating missing events through concurrent queries. It ranks candidate servers by room-membership popularity and recent reachability, and reuses requests already in flight instead of issuing duplicates. Resolved state for outlier events, fetch and backoff decisions, and per-server reachability ("Peer Status") are now cached persistently, and auth-chain, state, prev-event, and backfill fetches all run through it. Servers that used to re-request the same uncacheable lookups should see far less repeated federation traffic.
 
-- Thanks to @Enginecrafter77 password authorization flows can now be disabled by configuring `login_with_password = false`. Clients will hide the input boxes for username and password. This option is useful for an e.g. SSO-only server. (#336)
+- **OIDC device authorization grant (RFC 8628)** lets users sign in on input-constrained devices. The MSC4191 account-management action set is now complete with a deep-linked cross-signing reset, and MSC3861 OAuth 2.0/OIDC is advertised on `/versions`. The token endpoints and refresh-token lifecycle were reworked, dynamic client registration is opt-in and validates submitted client metadata, and device-scope binding requires PKCE. The OIDC authorization-server chapter of the documentation was expanded to match.
 
-- Thanks to @Lymia users of btrfs will see reduced space usage if they configure the new option `rocksdb_allow_fallocate = false`. (#322) (PR also has links to more information)
+- **Several additional MSCs** land this cycle: MSC3980 (`event_fields` trimming on `/sync`), MSC3860 (media download redirects), MSC4311 (`origin_server_ts` on the stripped create event), MSC1219 (key backup storage conformance), MSC2659 (appservice ping error codes), MSC3550 (`403 M_FORBIDDEN` allowed on profile lookup), and a stable `m.forget_forced_upon_leave` capability (MSC4267). MSC4380 invite blocking now also covers invites delivered through `/sync` and `createRoom`.
 
-- Instructions for how to configure the TURN server built into Livekit and several corrections were contributed by serial documentation author @winyadepla in (#285).
+- **Support-contact discovery gains a PGP field and policy links** (MSC4439, MSC4266), graciously contributed by @x86pup. The `/.well-known/matrix/support` endpoint can now advertise a `pgp_key` per contact (with raw key material rejected) and link support policies, and multiple support contacts can be configured with validation.
 
-- Many users will appreciate substantial documentation by @alametti for configuring well-known and root domain delegation in (#352).
+- @dasha-uwu added an `admin media preview` command for debugging URL previews, retired blurhashing, dropped the legacy media-preview redirect, and removed the deprecated server-keys endpoint.
 
-- Thank you @the-hazelnut for updating TURN and Matrix RTC documentation with ports to be forwarded for NAT. (#305) (#306)
+- Sliding sync (v5) now retracts departed and left rooms from the list and adds re-invited rooms back, so clients track membership churn without a full resync.
 
-- The `username` claim is now recognized when deciding the MXID during SSO account registration thanks to a suggestion by @aazf in (#287).
+- A device may now hold multiple access tokens, for easier rotation and concurrent sessions.
 
-- The max limit for `/messages` was increased from 100 to 1000 by @dasha-uwu which should match the limit on Synapse but with far less of a performance hazard.
+- `/context` can optionally resolve events it has not yet received over federation, and outbound HTTP compression gained per-direction opt-out switches.
 
-- @dasha-uwu properly optimized certain checked-math macros; other checked-math macros were also optimized for inlining.
+- An admin command to purge every room containing a given user was added, raised by @winyadepla in (#472).
 
-- Concurrent batch requests can now be made to a notary server. The default concurrency is now two, and the size of the batches have been decreased by a third. This should reduce the time it takes to join large rooms.
+- Documentation for `ip_source_trusted_subnets` now warns about accidentally including a proxy in the trusted set, courtesy of @BVollmerhaus in (#468).
 
-- Optimization of functions which hurt performance for syncing user-presence were partially completed, though with marked improvement from before.
-
-- Optimization of new state-resolution functionality added during Project Hydra took place. Along with additional optimization for auth-chain gathering, CPU use for large/complex rooms (so-called "bad rooms") has been greatly reduced.
+- Diagnostic admin command suites were added for the federation fetcher and Peer Status, and the runtime can dump tokio and getrusage metrics to JSON at exit.
 
 ### Bug Fixes
 
-- Special thanks to @hatomist for fixing an error which changes a users's account-type when they set a password (#313). This impacted LDAP and some SSO users. We apologize for the inconvenience this may have caused.
+- A regression introduced with `ip_source` in 1.6.1 blocked locally-connected appservices and other loopback clients (#465). Loopback peers and trusted-peer subnets now bypass the configured `ip_source`, including over the Unix-socket listener, and the `axum-client-ip` dependency was replaced with inlined helpers. Sincere apologies to everyone whose bridges went quiet.
 
-- We appreciate effort by @Jeidnx for addressing various issues with SSO/OIDC Identity Provider configuration in (#281). Also noteworthy was the idea to derive the callback_url from other parameters by default rather than explicitly requiring it. Thanks to @Magnitaizer for reporting initially in (#276).
+- Remote room directory and summary lookups are more resilient over federation: the room-summary fallback now tries every `via` server (5c9998374), and a failed remote `publicRooms` request now returns a `502` (9a879776c).
 
-- Thanks @VlaDexa for fixing the missing output formatting for the oauth delete command. (#321)
+- Thank you @x86pup for reporting in (#466) that a bad `unix_socket_path` produced an opaque startup failure; listener initialization errors now name the offending path.
 
-- Thank you @risu729 for updating the default port number in the docker run command documentation. (#298)
+- `!admin query oauth associate` replied with an empty message and did nothing, reported by @Vazgen005 in (#467). It now emits a confirmation and accepts a `force` flag.
 
-- Thank you @Lamby777 for removing an errant `version` field in the docker-compose example. (299)
+- @dasha-uwu fixed a compression configuration option that could accidentally disable client-side decompression.
 
-- Thank you @cornerot for updating the docker-compose with-traefik which still said Conduit instead of Tuwunel after all this time. (#308)
+- Several federation correctness fixes: the federation lock is now held across the invite residency check to close a join/unban race (add512b76); a `send_join` response that omits state fails over to other servers (9c158d3a0); each transaction's PDUs are sorted topologically before handling (91218e1df); and references outside the auth graph are treated as non-edges during resolution (664391995).
 
-- Thank you @exodrifter for fixing errors and typos in the MatrixRTC documentation (#343) based on a report by @RhenCloud (#338).
+- Knock membership is now persisted and a remote re-knock re-drives to reconcile state; per-PDU backfill errors are isolated so one bad event no longer aborts the batch; and thread redaction walks through the redacted target.
 
-- Thank you @wuyukai0403 for proofreading and fixing a typo in the troubleshooting document. (#312)
+- Media fetches and URL previews now honor CIDR denylists for the addresses they resolve to (af1266af3, 554557cf3). Buffered outbound responses are size-bounded, and federation key lookups are bounded and backed off.
 
-- A report by @BVollmerhaus lead to the reopening of (#240) to use Livekit/lk-jwt-service when federation is disabled. This was re-resolved by @dasha-uwu in (b79920a).
-
-- Thanks to @Jeidnx for identifying a missing SSO redirect route in (#290) which was fixed in (matrix-construct/ruma@0130f6a).
-
-- We appreciate the panic report by @Spaenny in #296 which occurred during SSL-related upgrades on the main branch. Fixed by @dasha-uwu (87faf81).
-
-- Thanks to report (#302) by @data-niklas whitespace in the configured `client_secret_file` is now properly ignored thanks to @dasha-uwu (6f5ae17).
-
-- After @Giwayume reported in (#303) that URL previews failed for some sites, an investigation by @dasha-uwu discovered Tuwunel's User-Agent header required some adjustment.
-
-- @dasha-uwu refactored the Unix socket listener with main-branch testing by @VlaDexa (#310) and follow-up fixes in (488bd62).
-
-- @jonathanmajh reported in (#315) and @wmstens simultaneously reported in (#318) that admin status was not granted to the server's first user when registering with SSO/OIDC. This was fixed by (e74186a).
-
-- After a report by @tcyrus in (#328) that the RPM postinst script is not properly creating the tuwunel user. This was fixed by @x86pup in (5a55f84).
-
-- Thank you @cloudrac3r for reporting in (#330) that events were being unnecessarily sent to some appservices. This was fixed by @dasha-uwu in (d073e17).
-
-- Thanks to the report in (#331) by @BVollmerhaus the first registered user is not granted admin when originating from an appservice. Fixed by @dasha-uwu in (9dfba59).
-
-- The report by @rexbron in (#337) discovered that some distributions set modest limits on threads per process. On many-core (32+) we may exceed these limits. The `RLIMIT_NPROC` is now raised (9e09162) to mitigate this.
-
-- @x86pup set ManagedOOMPreference=avoid due to systemd not recognizing pressure-based deallocation with `madvise(2)` is not an out-of-memory condition.
-
-- @dasha-uwu removed unnecessary added delays in the client endpoint for reporting.
-
-- Server shutdown did not properly indicate offline status of the conduit user due to a recent regression, now fixed.
-
-- @dasha-uwu fixed logic issues in the client `/members` query filter. These same logic errors were also found in Synapse and Dendrite.
-
-- @dasha-uwu fixed the missing advertisement for `org.matrix.msc3827.stable` in client `/versions`.
-
-- Custom profile fields were sometimes being double-escaped in responses to clients due to a JSON re-interpretation issue which is now fixed.
-
-- @dasha-uwu fixed checks related to canonical aliases (0381547c5).
-
-- @dasha-uwu relaxed the `encryption_enabled_by_default_for_room_type` "invite" option to not match all rooms.
-
-- @x86pup fixed an issue with `display_name` and `avatar_url` omitted in `/joined_members` (fixed in our Ruma).
-
-- Event processing of missing `prev_event`'s are no longer interrupted by an error from a sibling `prev_event`. This reduces CPU use by not repeating event processing before it would otherwise succeed.
+- Configuration handling improved: an unreadable `client_secret_file` now reports the path and IO error (844f123c7), matched keys can be excluded from the "unknown to tuwunel" warning (6bbfd0a93), and packaged builds no longer drop their `malloc_conf` tuning (de0eb1d2e).

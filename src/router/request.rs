@@ -10,9 +10,10 @@ use axum::{
 };
 use futures::FutureExt;
 use http::{Method, StatusCode, Uri};
-use tokio::{task, time::sleep};
+use ruma::api::error::ErrorKind;
+use tokio::{sync::Notify, task, time::sleep};
 use tracing::Span;
-use tuwunel_core::{Result, debug, debug_error, debug_warn, defer, err, error, trace};
+use tuwunel_core::{Error, Result, debug, debug_error, debug_warn, defer, error, trace};
 use tuwunel_service::Services;
 
 #[tracing::instrument(
@@ -34,7 +35,7 @@ pub(crate) async fn handle(
 	req: http::Request<axum::body::Body>,
 	next: axum::middleware::Next,
 ) -> Result<Response, StatusCode> {
-	if !services.server.running() {
+	if !services.server.is_running() {
 		debug_warn!(
 			method = %req.method(),
 			uri = %req.uri(),
@@ -46,32 +47,55 @@ pub(crate) async fn handle(
 
 	let uri = req.uri().clone();
 	let method = req.method().clone();
-	let services_ = services.clone();
 	let parent = Span::current();
-	let task = services.server.runtime().spawn(async move {
-		tokio::select! {
-			response = execute(&services_, req, next, &parent) => response,
-			response = services_.server.until_shutdown()
-				.then(|()| {
-					let timeout = services_.server.config.client_shutdown_timeout;
-					let timeout = Duration::from_secs(timeout);
-					sleep(timeout)
-				})
-				.map(|()| StatusCode::SERVICE_UNAVAILABLE)
-				.map(IntoResponse::into_response) => response,
-		}
-	});
+	let response = match method {
+		| Method::PUT | Method::POST | Method::DELETE | Method::PATCH =>
+			spawn_execute(services, req, next, parent).await?,
+		| _ => execute(&services, req, next, &parent).await,
+	};
+
+	handle_result(&method, &uri, response)
+}
+
+async fn spawn_execute(
+	services: Arc<Services>,
+	mut req: http::Request<axum::body::Body>,
+	next: axum::middleware::Next,
+	parent: Span,
+) -> Result<Response, StatusCode> {
+	let detached = Arc::new(Notify::new());
+	req.extensions_mut().insert(detached.clone());
+
+	let task = services
+		.clone()
+		.server
+		.runtime()
+		.spawn(async move {
+			tokio::select! {
+				response = execute(&services, req, next, &parent) => response,
+				response = services.server.until_shutdown()
+					.then(|()| {
+						let timeout = services.config.client_shutdown_timeout;
+						sleep(Duration::from_secs(timeout))
+					})
+					.map(|()| StatusCode::SERVICE_UNAVAILABLE)
+					.map(IntoResponse::into_response) => response,
+			}
+		});
 
 	let abort = task.abort_handle();
 	defer! {{
 		if !abort.is_finished() {
-			debug_warn!(task = ?abort.id(), "Client disconnected; detached request.");
-		}
-	}}
+			debug_warn!(
+				task = ?abort.id(),
+				"Client disconnected; detached request."
+			);
 
-	task.await
-		.map_err(unhandled)
-		.and_then(move |result| handle_result(&method, &uri, result))
+			detached.notify_one();
+		}
+	}};
+
+	task.await.map_err(unhandled)
 }
 
 #[tracing::instrument(
@@ -134,7 +158,12 @@ fn handle_result(method: &Method, uri: &Uri, result: Response) -> Result<Respons
 	}
 
 	if status == StatusCode::METHOD_NOT_ALLOWED {
-		return Ok(err!(Request(Unrecognized("Method Not Allowed"))).into_response());
+		return Ok(Error::Request(
+			ErrorKind::Unrecognized,
+			"Method Not Allowed".into(),
+			StatusCode::METHOD_NOT_ALLOWED,
+		)
+		.into_response());
 	}
 
 	Ok(result)

@@ -8,8 +8,10 @@ Documentation=https://tuwunel.chat/
 User=tuwunel
 Group=tuwunel
 Type=notify
+WatchdogSec=30
 
 Environment="TUWUNEL_CONFIG=/etc/tuwunel/tuwunel.toml"
+Environment="MALLOC_CONF=background_thread:false"
 
 ExecStart=/usr/sbin/tuwunel
 

@@ -3,10 +3,9 @@ use std::{
 	time::Duration,
 };
 
-use futures::{FutureExt, pin_mut};
+use futures::{FutureExt, future::join, pin_mut};
 use tuwunel_core::{
-	Error, Result, Server, debug, debug_error, debug_info, error, info,
-	utils::{BoolExt, future::OptionFutureExt},
+	Error, Result, Server, debug, debug_error, debug_info, error, info, utils::BoolExt,
 };
 use tuwunel_service::Services;
 
@@ -18,40 +17,58 @@ pub(crate) async fn run(services: Arc<Services>) -> Result {
 	let server = &services.server;
 	debug!("Start");
 
-	// Install the admin room callback here for now
-	tuwunel_admin::init(&services.admin).await;
+	// Install the admin command root here for now
+	tuwunel_admin::init(&services.admin);
+
+	// Execute configured startup commands.
+	services.admin.startup_execute().await?;
 
 	// Setup shutdown/signal handling
 	let handle = ServerHandle::new();
 	let sigs = server
 		.runtime()
 		.spawn(signal(server.clone(), handle.clone()));
+	#[cfg(all(feature = "systemd", target_os = "linux"))]
+	let watchdog = server.runtime().spawn(start_systemd_watchdog());
 
-	let listener = services
+	let non_listener = services
 		.config
 		.listening
-		.then_async(|| {
-			server
-				.runtime()
-				.spawn(serve::serve(services.clone(), handle))
-				.map(|res| res.map_err(Error::from).unwrap_or_else(Err))
-		})
-		.unwrap_or_else_async(|| server.until_shutdown().map(Ok));
+		.is_false()
+		.then_async(|| server.until_shutdown().map(Ok));
+
+	let listener = services.config.listening.then_async(|| {
+		server
+			.runtime()
+			.spawn(serve::serve(services.clone(), handle))
+			.map(|res| res.map_err(Error::from).unwrap_or_else(Err))
+	});
 
 	// Focal point
 	debug!("Running");
-	pin_mut!(listener);
+	pin_mut!(listener, non_listener);
 	let res = tokio::select! {
-		res = &mut listener => res.unwrap_or(Ok(())),
-		res = services.poll() => handle_services_finish(server, res, listener.await),
+		res = join(&mut listener, &mut non_listener) => {
+			res.0.unwrap_or(res.1.unwrap_or(Ok(())))
+		},
+		res = services.poll() => {
+			server.until_shutdown().await;
+			handle_services_finish(server, res, listener.await)
+		},
 	};
 
-	// Join the signal handler before we leave.
+	// Join watchdog and the signal handler before we leave.
+	#[cfg(all(feature = "systemd", target_os = "linux"))]
+	{
+		watchdog.abort();
+		_ = watchdog.await;
+	};
+
 	sigs.abort();
 	_ = sigs.await;
 
-	// Remove the admin room callback
-	tuwunel_admin::fini(&services.admin).await;
+	// Remove the admin command root
+	tuwunel_admin::fini(&services.admin);
 
 	debug_info!("Finish");
 	res
@@ -65,7 +82,7 @@ pub(crate) async fn start(server: Arc<Server>) -> Result<Arc<Services>> {
 	let services = Services::build(server).await?.start().await?;
 
 	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	sd_notify::notify(false, &[sd_notify::NotifyState::Ready])
+	sd_notify::notify(&[sd_notify::NotifyState::Ready])
 		.expect("failed to notify systemd of ready state");
 
 	debug!("Started");
@@ -78,7 +95,10 @@ pub(crate) async fn stop(services: Arc<Services>) -> Result {
 	debug!("Shutting down...");
 
 	#[cfg(all(feature = "systemd", target_os = "linux"))]
-	sd_notify::notify(true, &[sd_notify::NotifyState::Stopping])
+	// SAFETY: clears NOTIFY_SOCKET from the process environment. Safe because no
+	// other thread reads or writes that variable; this matches the previous
+	// `notify(unset_env=true, ...)` semantics from sd-notify 0.4.
+	unsafe { sd_notify::notify_and_unset_env(&[sd_notify::NotifyState::Stopping]) }
 		.expect("failed to notify systemd of stopping state");
 
 	// Wait for all completions before dropping or we'll lose them to the module
@@ -133,7 +153,7 @@ fn handle_services_finish(
 ) -> Result {
 	debug!("Service manager finished: {result:?}");
 
-	if server.running()
+	if server.is_running()
 		&& let Err(e) = server.shutdown()
 	{
 		error!("Failed to send shutdown signal: {e}");
@@ -144,4 +164,27 @@ fn handle_services_finish(
 	}
 
 	result
+}
+
+#[cfg(all(feature = "systemd", target_os = "linux"))]
+async fn start_systemd_watchdog() {
+	use tokio::time::MissedTickBehavior;
+
+	let Some(watchdog) = sd_notify::watchdog_enabled() else {
+		return;
+	};
+
+	let watchdog_usec = u64::try_from(watchdog.as_micros()).unwrap_or(u64::MAX);
+	let interval_usec = (watchdog_usec / 2).max(1);
+	let interval = Duration::from_micros(interval_usec);
+
+	let mut ticker = tokio::time::interval(interval);
+	ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+	loop {
+		ticker.tick().await;
+
+		if let Err(e) = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]) {
+			error!("failed to notify systemd watchdog state: {e}");
+		}
+	}
 }

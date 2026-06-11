@@ -3,9 +3,9 @@ mod filter;
 mod rooms;
 mod selector;
 
-use std::{collections::BTreeMap, fmt::Debug, time::Duration};
+use std::{collections::BTreeMap, fmt::Debug, sync::Arc, time::Duration};
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use futures::{
 	FutureExt, TryFutureExt,
 	future::{join, try_join},
@@ -15,7 +15,10 @@ use ruma::{
 	api::client::sync::sync_events::v5::{ListId, Request, Response, response},
 	events::room::member::MembershipState,
 };
-use tokio::time::{Instant, timeout_at};
+use tokio::{
+	sync::Notify,
+	time::{Instant, timeout_at},
+};
 use tuwunel_core::{
 	Err, Result, debug,
 	debug::INFO_SPAN_LEVEL,
@@ -31,7 +34,7 @@ use tuwunel_service::{
 };
 
 use super::share_encrypted_room;
-use crate::Ruma;
+use crate::{ClientIp, Ruma};
 
 #[derive(Copy, Clone)]
 struct SyncInfo<'a> {
@@ -75,6 +78,8 @@ type ListIds = SmallVec<[ListId; 1]>;
 	)
 )]
 pub(crate) async fn sync_events_v5_route(
+	Extension(interrupted): Extension<Arc<Notify>>,
+	ClientIp(client): ClientIp,
 	State(ref services): State<crate::State>,
 	body: Ruma<Request>,
 ) -> Result<Response> {
@@ -93,11 +98,7 @@ pub(crate) async fn sync_events_v5_route(
 		.map(Duration::as_millis)
 		.map(TryInto::try_into)
 		.flat_ok()
-		.map(|timeout: u64| {
-			timeout
-				.max(services.config.client_sync_timeout_min)
-				.min(services.config.client_sync_timeout_max)
-		})
+		.map(|timeout: u64| timeout.min(services.config.client_sync_timeout_max))
 		.unwrap_or(0);
 
 	let conn_key = into_connection_key(sender_user, sender_device, request.conn_id.as_deref());
@@ -109,7 +110,7 @@ pub(crate) async fn sync_events_v5_route(
 	let conn = conn_val.lock();
 	let ping_presence = services
 		.presence
-		.maybe_ping_presence(sender_user, sender_device, &request.set_presence)
+		.maybe_ping_presence(sender_user, sender_device, Some(client), &request.set_presence)
 		.inspect_err(inspect_log)
 		.ok();
 
@@ -164,11 +165,10 @@ pub(crate) async fn sync_events_v5_route(
 		);
 
 		let window;
-		let watchers = services.sync.watch(
-			sender_user,
-			sender_device,
-			services.state_cache.rooms_joined(sender_user),
-		);
+		let watchers = services
+			.sync
+			.watch(sender_user, sender_device, services.state_cache.rooms_joined(sender_user))
+			.await;
 
 		conn.next_batch = services.globals.wait_pending().await?;
 		(window, response.lists) = selector::selector(&mut conn, sync_info)
@@ -194,15 +194,16 @@ pub(crate) async fn sync_events_v5_route(
 			}
 		}
 
-		if timeout == 0
-			|| services.server.is_stopping()
-			|| timeout_at(stop_at, watchers)
-				.boxed()
-				.await
-				.is_err()
-		{
+		let waiter = async || {
+			tokio::select! {
+				() = interrupted.notified() => true,
+				watch = timeout_at(stop_at, watchers) => watch.is_err(),
+			}
+		};
+
+		if timeout == 0 || services.server.is_stopping() || waiter().boxed().await {
 			response.pos = conn.next_batch.to_string().into();
-			trace!(conn.globalsince, conn.next_batch, "timeout; empty response {response:?}");
+			trace!(conn.globalsince, conn.next_batch, "empty response {response:?}");
 			conn.store(&services.sync, &conn_key);
 			return Ok(response);
 		}

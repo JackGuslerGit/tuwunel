@@ -1,12 +1,13 @@
 use axum::extract::State;
 use futures::{StreamExt, TryStreamExt};
-use ruma::{api::client::threads::get_threads, uint};
+use ruma::api::client::threads::get_threads;
 use tuwunel_core::{
 	Result, at,
 	matrix::{
 		Event,
 		pdu::{PduCount, PduEvent},
 	},
+	result::FlatOk,
 };
 
 use crate::Ruma;
@@ -19,8 +20,8 @@ pub(crate) async fn get_threads_route(
 	// Use limit or else 10, with maximum 100
 	let limit = body
 		.limit
-		.unwrap_or_else(|| uint!(10))
-		.try_into()
+		.map(usize::try_from)
+		.flat_ok()
 		.unwrap_or(10)
 		.min(100);
 
@@ -34,7 +35,6 @@ pub(crate) async fn get_threads_route(
 	let threads: Vec<(PduCount, PduEvent)> = services
 		.threads
 		.threads_until(body.sender_user(), &body.room_id, from, &body.include)
-		.take(limit)
 		.try_filter_map(async |(count, pdu)| {
 			Ok(services
 				.state_accessor
@@ -42,13 +42,13 @@ pub(crate) async fn get_threads_route(
 				.await
 				.then_some((count, pdu)))
 		})
+		.take(limit)
 		.try_collect()
 		.await?;
 
 	Ok(get_threads::v1::Response {
 		next_batch: threads
 			.last()
-			.filter(|_| threads.len() >= limit)
 			.map(at!(0))
 			.as_ref()
 			.map(ToString::to_string),

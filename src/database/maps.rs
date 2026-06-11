@@ -18,6 +18,7 @@ pub(super) fn open(engine: &Arc<Engine>) -> Result<Maps> { open_list(engine, MAP
 pub(super) fn open_list(engine: &Arc<Engine>, maps: &[Descriptor]) -> Result<Maps> {
 	maps.iter()
 		.filter(|desc| !desc.dropped)
+		.filter(|desc| engine.has_cf(desc.name))
 		.map(|desc| Ok((desc.name, Map::open(engine, desc.name)?)))
 		.collect()
 }
@@ -39,6 +40,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 		name: "authchainkey_authchain",
 		cache_disp: CacheDisp::SharedWith("shorteventid_authchain"),
 		compression: CompressionType::None,
+		cache_shards: 32,
 		index_size: 1024,
 		block_size: 4096,
 		key_size_hint: Some(8), // intentionally match shorteventid_authchain
@@ -66,6 +68,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "eventid_backoff",
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
 		name: "eventid_originalpdu",
 		key_size_hint: Some(48),
 		val_size_hint: Some(1520),
@@ -90,6 +96,14 @@ pub(super) static MAPS: &[Descriptor] = &[
 		block_size: 512,
 		index_size: 512,
 		..descriptor::RANDOM
+	},
+	Descriptor {
+		name: "eventid_policysigstate",
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
+		name: "eventid_resolvedstate",
+		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
 		name: "eventid_shorteventid",
@@ -146,7 +160,45 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "oidc_signingkey",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "oidcclientid_registration",
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
+		name: "oidccode_authsession",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "oidcdevice_userdeviceid",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "oidcdevicecode_devicegrant",
+		ttl: 60 * 60 * 24,
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
+		name: "oidcusercode_devicecode",
+		ttl: 60 * 60 * 24,
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
+		name: "oidccskeybypass_userid",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "oidcreqid_authrequest",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "onetimekeyid_onetimekeys",
+		..descriptor::DROPPED
+	},
+	Descriptor {
+		name: "onetimekeyid4225_otk",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
@@ -221,6 +273,16 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "roomid_spacehierarchy",
+		limit_size: 1024 * 1024 * 64,
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
+		name: "roomid_ts_pducount",
+		val_size_hint: Some(8),
+		..descriptor::RANDOM
+	},
+	Descriptor {
 		name: "roomserverids",
 		..descriptor::RANDOM_SMALL
 	},
@@ -293,6 +355,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "servername_override",
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
+		name: "servername_status",
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
@@ -378,6 +444,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "spentrefresh_userdeviceid",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "token_userdeviceid",
 		..descriptor::RANDOM_SMALL
 	},
@@ -404,12 +474,24 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "userdeviceid_spentrefresh",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "userdeviceid_token",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
-		name: "userdevicesessionid_uiaainfo",
+		name: "userdeviceidtoken_index",
 		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "userdeviceidalgorithm_fallback",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "userdevicesessionid_uiaainfo",
+		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
 		name: "userdevicetxnid_response",
@@ -444,6 +526,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
+		name: "userid_locked",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "userid_masterkeyid",
 		..descriptor::RANDOM_SMALL
 	},
@@ -465,6 +551,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "userid_selfsigningkeyid",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "userid_suspended",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {

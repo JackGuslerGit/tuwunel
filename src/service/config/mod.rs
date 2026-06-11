@@ -21,7 +21,7 @@ impl crate::Service for Service {
 
 	async fn worker(self: Arc<Self>) -> Result {
 		let mut signaled = self.server.signal.subscribe();
-		while self.server.running() {
+		while self.server.is_running() {
 			tokio::select! {
 				() = self.server.until_shutdown() => break,
 				signal = signaled.recv() => if signal !=  Ok(SIGNAL) { continue; },
@@ -49,7 +49,7 @@ impl Deref for Service {
 fn handle_reload(&self) -> Result {
 	if self.server.config.config_reload_signal {
 		#[cfg(all(feature = "systemd", target_os = "linux"))]
-		sd_notify::notify(false, &[
+		sd_notify::notify(&[
 			sd_notify::NotifyState::Reloading,
 			sd_notify::NotifyState::monotonic_usec_now().expect("failed to get monotonic time"),
 		])
@@ -58,7 +58,7 @@ fn handle_reload(&self) -> Result {
 		self.reload(iter::empty())?;
 
 		#[cfg(all(feature = "systemd", target_os = "linux"))]
-		sd_notify::notify(false, &[sd_notify::NotifyState::Ready])
+		sd_notify::notify(&[sd_notify::NotifyState::Ready])
 			.expect("failed to notify systemd of ready state");
 	}
 

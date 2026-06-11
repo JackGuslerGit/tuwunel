@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeMap, HashMap, HashSet},
+	collections::{BTreeMap, HashMap, HashSet, btree_map::Entry},
 	fmt::Debug,
 	sync::{
 		Arc,
@@ -41,6 +41,7 @@ use ruma::{
 use tuwunel_core::{
 	Error, Event, Result, debug, err, error, extract_variant,
 	result::LogErr,
+	smallvec::SmallVec,
 	trace,
 	utils::{
 		BoolExt, ReadyExt, calculate_hash, continue_exponential_backoff_secs,
@@ -51,12 +52,15 @@ use tuwunel_core::{
 };
 
 use super::{Destination, EduBuf, EduVec, Msg, SendingEvent, Service, data::QueueItem};
-use crate::rooms::timeline::RawPduId;
+use crate::{federation::ShouldAttempt, rooms::timeline::RawPduId};
 
+/// In-flight bookkeeping for one `Destination`. Cross-attempt backoff lives
+/// in `peer_status` (federation only); appservice/push paths keep their own
+/// status because they are not server-keyed.
 #[derive(Debug)]
 enum TransactionStatus {
 	Running,
-	Failed(u32, Instant), // number of times failed, time of last failure
+	Failed(u32, Instant), // push backoff: tries, last failure
 	Retrying(u32),        // number of times failed
 }
 
@@ -66,9 +70,19 @@ type SendingFuture<'a> = BoxFuture<'a, SendingResult>;
 type SendingFutures<'a> = FuturesUnordered<SendingFuture<'a>>;
 type CurTransactionStatus = HashMap<Destination, TransactionStatus>;
 
+/// Per-(room, user) bucket of `ReceiptData`. MSC3771 allows one receipt
+/// per thread context per user per EDU window; the dominant case is
+/// still a single receipt, so inline-1 fits without a heap touch.
+type UserReceipts = SmallVec<[ReceiptData; 1]>;
+
+/// Per-rank slice of receipt EDU output. Each entry becomes one
+/// `Edu::Receipt` buffer; rank 0 carries each user's earliest receipt
+/// in the window, rank 1 the next, and so on. Most windows produce a
+/// single rank.
+type RankedReceipts = SmallVec<[ReceiptMap; 1]>;
+
 const SELECT_PRESENCE_LIMIT: usize = 256;
 const SELECT_RECEIPT_LIMIT: usize = 256;
-const SELECT_EDU_LIMIT: usize = EDU_LIMIT - 2;
 const DEQUEUE_LIMIT: usize = 48;
 
 pub const PDU_LIMIT: usize = 50;
@@ -145,17 +159,21 @@ impl Service {
 
 	fn handle_response_err(dest: Destination, statuses: &mut CurTransactionStatus, e: &Error) {
 		debug!(dest = ?dest, "{e:?}");
+		// Push backs off locally; federation defers to peer_status, appservice retries.
+		let push = matches!(dest, Destination::Push(..));
+
 		statuses.entry(dest).and_modify(|e| {
-			*e = match e {
-				| TransactionStatus::Running => TransactionStatus::Failed(1, Instant::now()),
+			let tries = match e {
+				| TransactionStatus::Running => 1,
+				| TransactionStatus::Failed(n, _) | TransactionStatus::Retrying(n) =>
+					n.saturating_add(1),
+			};
 
-				| &mut TransactionStatus::Retrying(ref n) =>
-					TransactionStatus::Failed(n.saturating_add(1), Instant::now()),
-
-				| TransactionStatus::Failed(..) => {
-					panic!("Request that was not even running failed?!")
-				},
-			}
+			*e = if push {
+				TransactionStatus::Failed(tries, Instant::now())
+			} else {
+				TransactionStatus::Retrying(tries)
+			};
 		});
 	}
 
@@ -296,7 +314,7 @@ impl Service {
 		new_events: Vec<QueueItem>, // Events we want to send: event and full key
 		statuses: &mut CurTransactionStatus,
 	) -> Result<Option<Vec<SendingEvent>>> {
-		let (allow, retry) = self.select_events_current(dest, statuses)?;
+		let (allow, retry) = self.select_events_current(dest, statuses).await?;
 
 		// Nothing can be done for this remote, bail out.
 		if !allow {
@@ -340,30 +358,48 @@ impl Service {
 		Ok(Some(events))
 	}
 
-	fn select_events_current(
+	async fn select_events_current(
 		&self,
 		dest: &Destination,
 		statuses: &mut CurTransactionStatus,
 	) -> Result<(bool, bool)> {
+		// peer_status gates federation only; appservice and push fall through.
+		if let Destination::Federation(server) = dest
+			&& matches!(
+				self.services
+					.federation
+					.should_attempt(server)
+					.await,
+				ShouldAttempt::No { .. },
+			) {
+			return Ok((false, false));
+		}
+
 		let (mut allow, mut retry) = (true, false);
 		statuses
-			.entry(dest.clone()) // TODO: can we avoid cloning?
+			.entry(dest.clone())
 			.and_modify(|e| match e {
-				TransactionStatus::Failed(tries, time) => {
-					// Fail if a request has failed recently (exponential backoff)
+				| TransactionStatus::Running => {
+					allow = false; // already running
+				},
+				| TransactionStatus::Failed(tries, time) => {
+					// Push backoff: hold off until the exponential window elapses.
 					let min = self.server.config.sender_timeout;
 					let max = self.server.config.sender_retry_backoff_limit;
-					if continue_exponential_backoff_secs(min, max, time.elapsed(), *tries)
-						&& !matches!(dest, Destination::Appservice(_))
-					{
+					if continue_exponential_backoff_secs(min, max, time.elapsed(), *tries) {
 						allow = false;
 					} else {
 						retry = true;
 						*e = TransactionStatus::Retrying(*tries);
 					}
 				},
-				TransactionStatus::Running | TransactionStatus::Retrying(_) => {
-					allow = false; // already running
+				| TransactionStatus::Retrying(_) if matches!(dest, Destination::Push(..)) => {
+					allow = false; // push retry already in flight
+				},
+				| TransactionStatus::Retrying(_) => {
+					// Promote to Running so a concurrent select does not double-send.
+					retry = true;
+					*e = TransactionStatus::Running;
 				},
 			})
 			.or_insert(TransactionStatus::Running);
@@ -393,13 +429,17 @@ impl Service {
 			.server
 			.config
 			.allow_outgoing_read_receipts
-			.then_async(|| self.select_edus_receipts(server_name, batch, &max_edu_count));
+			.then_async(|| {
+				self.select_edus_receipts(server_name, batch, &max_edu_count, &events_len)
+			});
 
 		let presence = self
 			.server
 			.config
 			.allow_outgoing_presence
-			.then_async(|| self.select_edus_presence(server_name, batch, &max_edu_count));
+			.then_async(|| {
+				self.select_edus_presence(server_name, batch, &max_edu_count, &events_len)
+			});
 
 		let (device_changes, receipts, presence) =
 			join3(device_changes, receipts, presence).await;
@@ -415,7 +455,7 @@ impl Service {
 	#[tracing::instrument(
 		name = "device_changes",
 		level = "trace",
-		skip(self, server_name, max_edu_count)
+		skip(self, server_name, max_edu_count, events_len)
 	)]
 	async fn select_edus_device_changes(
 		&self,
@@ -464,10 +504,12 @@ impl Service {
 				serde_json::to_writer(&mut buf, &edu)
 					.expect("failed to serialize device list update to JSON");
 
-				events.push(buf);
-				if events_len.fetch_add(1, Ordering::Relaxed) >= SELECT_EDU_LIMIT - 1 {
+				// Reserve before push so concurrent producers see the count first.
+				if events_len.fetch_add(1, Ordering::Relaxed) >= EDU_LIMIT {
 					return events;
 				}
+
+				events.push(buf);
 			}
 		}
 
@@ -475,52 +517,90 @@ impl Service {
 	}
 
 	/// Look for read receipts in this room
+	///
+	/// MSC3771 lets a user emit multiple receipts in the same EDU window, one
+	/// per thread context. The federation EDU shape allows only one
+	/// `ReceiptData` per `(room, user)` slot, so a user with N parallel
+	/// thread receipts ships across N parallel `Edu::Receipt` buffers within
+	/// the same transaction. Each buffer is shape-compliant; receivers
+	/// process them as independent receipt EDUs and our storage keeps each
+	/// thread distinct.
 	#[tracing::instrument(
 		name = "receipts",
 		level = "trace",
-		skip(self, server_name, max_edu_count)
+		skip(self, server_name, max_edu_count, events_len)
 	)]
 	async fn select_edus_receipts(
 		&self,
 		server_name: &ServerName,
 		since: (u64, u64),
 		max_edu_count: &AtomicU64,
-	) -> Option<EduBuf> {
+		events_len: &AtomicUsize,
+	) -> EduVec {
 		let num = AtomicUsize::new(0);
-		let receipts: BTreeMap<OwnedRoomId, ReceiptMap> = self
+		let by_room: SmallVec<[(OwnedRoomId, RankedReceipts); 1]> = self
 			.services
 			.state_cache
 			.server_rooms(server_name)
 			.map(ToOwned::to_owned)
 			.broad_filter_map(async |room_id| {
-				let receipt_map = self
+				let ranked = self
 					.select_edus_receipts_room(&room_id, since, max_edu_count, &num)
 					.await;
 
-				receipt_map
-					.read
+				ranked
 					.is_empty()
-					.eq(&false)
-					.then_some((room_id, receipt_map))
+					.is_false()
+					.then_some((room_id, ranked))
 			})
 			.collect()
 			.boxed()
 			.await;
 
-		if receipts.is_empty() {
-			return None;
-		}
+		let max_rank = by_room
+			.iter()
+			.map(|(_, maps)| maps.len())
+			.max()
+			.unwrap_or(0);
 
-		let receipt_content = Edu::Receipt(ReceiptContent { receipts });
+		let pivot_rank = |rank: usize| -> Option<BTreeMap<OwnedRoomId, ReceiptMap>> {
+			let receipts: BTreeMap<_, _> = by_room
+				.iter()
+				.filter_map(|(room_id, maps)| {
+					maps.get(rank)
+						.cloned()
+						.map(|map| (room_id.clone(), map))
+				})
+				.collect();
 
-		let mut buf = EduBuf::new();
-		serde_json::to_writer(&mut buf, &receipt_content)
-			.expect("Failed to serialize Receipt EDU to JSON vec");
+			receipts.is_empty().is_false().then_some(receipts)
+		};
 
-		Some(buf)
+		let serialize_edu = |receipts: BTreeMap<OwnedRoomId, ReceiptMap>| -> EduBuf {
+			let mut buf = EduBuf::new();
+			serde_json::to_writer(&mut buf, &Edu::Receipt(ReceiptContent { receipts }))
+				.expect("Failed to serialize Receipt EDU to JSON vec");
+			buf
+		};
+
+		// Reserve a slot per rank from the shared EDU budget.
+		let reserve = |_: &_| events_len.fetch_add(1, Ordering::Relaxed) < EDU_LIMIT;
+
+		(0..max_rank)
+			.filter_map(pivot_rank)
+			.take_while(reserve)
+			.map(serialize_edu)
+			.collect()
 	}
 
-	/// Look for read receipts in this room
+	/// Look for read receipts in this room.
+	///
+	/// Returns a per-rank vector of [`ReceiptMap`]s. Each user's receipts in
+	/// the window (one per thread context, count-ordered) are placed into
+	/// successive ranks, so rank 0 carries each user's earliest receipt,
+	/// rank 1 the next, and so on. The receipt-limit budget bounds distinct
+	/// users only; subsequent thread receipts for an already-counted user do
+	/// not consume additional budget.
 	#[tracing::instrument(
 		name = "receipts",
 		level = "trace",
@@ -532,14 +612,14 @@ impl Service {
 		since: (u64, u64),
 		max_edu_count: &AtomicU64,
 		num: &AtomicUsize,
-	) -> ReceiptMap {
+	) -> RankedReceipts {
 		let receipts =
 			self.services
 				.read_receipt
 				.readreceipts_since(room_id, since.0, Some(since.1));
 
 		pin_mut!(receipts);
-		let mut read = BTreeMap::<OwnedUserId, ReceiptData>::new();
+		let mut by_user = BTreeMap::<OwnedUserId, UserReceipts>::new();
 		while let Some((user_id, count, read_receipt)) = receipts.next().await {
 			debug_assert!(count <= since.1, "exceeds upper-bound");
 
@@ -571,36 +651,54 @@ impl Service {
 				.remove(user_id)
 				.expect("our read receipts always have the user here");
 
-			let receipt_data = ReceiptData {
-				data: receipt,
-				event_ids: vec![event_id.clone()],
-			};
+			let receipt_data = ReceiptData { data: receipt, event_ids: vec![event_id] };
 
-			if read
-				.insert(user_id.to_owned(), receipt_data)
-				.is_none()
-			{
-				let num = num.fetch_add(1, Ordering::Relaxed);
-				if num >= SELECT_RECEIPT_LIMIT {
-					break;
-				}
+			match by_user.entry(user_id.to_owned()) {
+				| Entry::Vacant(slot) => {
+					slot.insert(SmallVec::from_buf([receipt_data]));
+					let num = num.fetch_add(1, Ordering::Relaxed);
+					if num >= SELECT_RECEIPT_LIMIT {
+						break;
+					}
+				},
+				| Entry::Occupied(mut slot) => {
+					slot.get_mut().push(receipt_data);
+				},
 			}
 		}
 
-		ReceiptMap { read }
+		// Pivot per-user count-ordered receipts into rank-major
+		// `RankedReceipts`. Rank 0 carries each user's earliest receipt in
+		// the window, rank 1 the next, and so on.
+		by_user
+			.into_iter()
+			.fold(RankedReceipts::new(), |mut acc, (user_id, receipts)| {
+				for (rank, receipt_data) in receipts.into_iter().enumerate() {
+					if rank >= acc.len() {
+						acc.push(ReceiptMap { read: BTreeMap::new() });
+					}
+
+					acc[rank]
+						.read
+						.insert(user_id.clone(), receipt_data);
+				}
+
+				acc
+			})
 	}
 
 	/// Look for presence
 	#[tracing::instrument(
 		name = "presence",
 		level = "trace",
-		skip(self, server_name, max_edu_count)
+		skip(self, server_name, max_edu_count, events_len)
 	)]
 	async fn select_edus_presence(
 		&self,
 		server_name: &ServerName,
 		since: (u64, u64),
 		max_edu_count: &AtomicU64,
+		events_len: &AtomicUsize,
 	) -> Option<EduBuf> {
 		let presence_since = self
 			.services
@@ -657,6 +755,11 @@ impl Service {
 		}
 
 		if presence_updates.is_empty() {
+			return None;
+		}
+
+		// Reserve our slot in the shared transaction budget before serializing.
+		if events_len.fetch_add(1, Ordering::Relaxed) >= EDU_LIMIT {
 			return None;
 		}
 

@@ -29,7 +29,7 @@ pub(crate) use self::{
 };
 use crate::Ruma;
 
-/// # `POST /_matrix/client/r0/joined_rooms`
+/// # `GET /_matrix/client/r0/joined_rooms`
 ///
 /// Lists all rooms the user has joined.
 pub(crate) async fn joined_rooms_route(
@@ -69,16 +69,15 @@ pub(crate) async fn banned_room_check(
 		|| room_id.server_name().is_some_and(|server_name| {
 			services
 				.config
-				.forbidden_remote_server_names
-				.is_match(server_name.host())
+				.is_forbidden_remote_server_name(server_name)
 		})
 		// ... or alias server is banned
 		|| orig_room_id.is_some_and(|orig_room_id| {
-			orig_room_id.server_name().is_some_and(|orig_server_name|
+			orig_room_id.server_name().is_some_and(|orig_server_name| {
 			services
 				.config
-				.forbidden_remote_server_names
-				.is_match(orig_server_name.host()))
+				.is_forbidden_remote_server_name(orig_server_name)
+		})
 	}) {
 		warn!(
 			"User {user_id} who is not an admin attempted to send an invite for or attempted to \
@@ -115,7 +114,7 @@ async fn maybe_deactivate(services: &Services, user_id: &UserId, client_ip: IpAd
 
 		services
 			.deactivate
-			.full_deactivate(user_id)
+			.full_deactivate(user_id, false)
 			.boxed()
 			.await?;
 	}

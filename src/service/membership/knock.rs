@@ -69,11 +69,19 @@ pub async fn knock(
 		return Err!(Request(Forbidden("You cannot knock on a room you are already joined in.")));
 	}
 
-	if self
+	let server_in_room = self
 		.services
 		.state_cache
-		.is_knocked(sender_user, room_id)
-		.await
+		.server_in_room(self.services.globals.server_name(), room_id)
+		.await;
+
+	// Trust a local knock; re-drive a remote one in case we missed a kick.
+	if server_in_room
+		&& self
+			.services
+			.state_cache
+			.is_knocked(sender_user, room_id)
+			.await
 	{
 		debug_warn!("{sender_user} is already knocked in {room_id}");
 		return Ok(());
@@ -88,12 +96,6 @@ pub async fn knock(
 		debug_warn!("{sender_user} is banned from {room_id} but attempted to knock");
 		return Err!(Request(Forbidden("You cannot knock on a room you are banned from.")));
 	}
-
-	let server_in_room = self
-		.services
-		.state_cache
-		.server_in_room(self.services.globals.server_name(), room_id)
-		.await;
 
 	let local_knock = server_in_room
 		|| servers.is_empty()
@@ -127,42 +129,12 @@ async fn knock_room_helper_local(
 		.get_room_version(room_id)
 		.await?;
 
-	if matches!(
-		room_version_id,
-		RoomVersionId::V1
-			| RoomVersionId::V2
-			| RoomVersionId::V3
-			| RoomVersionId::V4
-			| RoomVersionId::V5
-			| RoomVersionId::V6
-	) {
-		return Err!(Request(Forbidden("This room does not support knocking.")));
-	}
+	ensure_room_version_supports_knock(&room_version_id)?;
 
-	let content = RoomMemberEventContent {
-		displayname: self
-			.services
-			.users
-			.displayname(sender_user)
-			.await
-			.ok(),
-		avatar_url: self
-			.services
-			.users
-			.avatar_url(sender_user)
-			.await
-			.ok(),
-		blurhash: self
-			.services
-			.users
-			.blurhash(sender_user)
-			.await
-			.ok(),
-		reason: reason.clone(),
-		..RoomMemberEventContent::new(MembershipState::Knock)
-	};
+	let content = self
+		.build_knock_member_content(sender_user, reason.clone())
+		.await;
 
-	// Try normal knock first
 	let Err(error) = self
 		.services
 		.timeline
@@ -185,13 +157,73 @@ async fn knock_room_helper_local(
 
 	warn!("We couldn't do the knock locally, maybe federation can help to satisfy the knock");
 
+	self.knock_room_local_federation_fallback(sender_user, room_id, reason, servers, state_lock)
+		.boxed()
+		.await
+}
+
+fn ensure_room_version_supports_knock(room_version_id: &RoomVersionId) -> Result {
+	if matches!(
+		room_version_id,
+		RoomVersionId::V1
+			| RoomVersionId::V2
+			| RoomVersionId::V3
+			| RoomVersionId::V4
+			| RoomVersionId::V5
+			| RoomVersionId::V6
+	) {
+		return Err!(Request(Forbidden("This room does not support knocking.")));
+	}
+
+	Ok(())
+}
+
+#[implement(Service)]
+async fn build_knock_member_content(
+	&self,
+	sender_user: &UserId,
+	reason: Option<String>,
+) -> RoomMemberEventContent {
+	RoomMemberEventContent {
+		displayname: self
+			.services
+			.users
+			.displayname(sender_user)
+			.await
+			.ok(),
+		avatar_url: self
+			.services
+			.users
+			.avatar_url(sender_user)
+			.await
+			.ok(),
+		blurhash: self
+			.services
+			.users
+			.blurhash(sender_user)
+			.await
+			.ok(),
+		reason,
+		..RoomMemberEventContent::new(MembershipState::Knock)
+	}
+}
+
+#[implement(Service)]
+async fn knock_room_local_federation_fallback(
+	&self,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	reason: Option<String>,
+	servers: &[OwnedServerName],
+	state_lock: &RoomMutexGuard,
+) -> Result {
 	let (make_knock_response, remote_server) = self
 		.make_knock_request(sender_user, room_id, servers)
 		.await?;
 
 	info!("make_knock finished");
 
-	let room_version_id = make_knock_response.room_version;
+	let room_version_id = make_knock_response.room_version.clone();
 
 	if !self
 		.services
@@ -203,112 +235,47 @@ async fn knock_room_helper_local(
 		));
 	}
 
-	let mut knock_event_stub = serde_json::from_str::<CanonicalJsonObject>(
-		make_knock_response.event.get(),
-	)
-	.map_err(|e| {
-		err!(BadServerResponse("Invalid make_knock event json received from server: {e:?}"))
-	})?;
-
-	knock_event_stub.insert(
-		"origin".into(),
-		CanonicalJsonValue::String(
-			self.services
-				.globals
-				.server_name()
-				.as_str()
-				.to_owned(),
-		),
-	);
-	knock_event_stub.insert(
-		"origin_server_ts".into(),
-		CanonicalJsonValue::Integer(
-			utils::millis_since_unix_epoch()
-				.try_into()
-				.expect("Timestamp is valid js_int value"),
-		),
-	);
-	knock_event_stub.insert(
-		"content".into(),
-		to_canonical_value(RoomMemberEventContent {
-			displayname: self
-				.services
-				.users
-				.displayname(sender_user)
-				.await
-				.ok(),
-			avatar_url: self
-				.services
-				.users
-				.avatar_url(sender_user)
-				.await
-				.ok(),
-			blurhash: self
-				.services
-				.users
-				.blurhash(sender_user)
-				.await
-				.ok(),
-			reason,
-			..RoomMemberEventContent::new(MembershipState::Knock)
-		})
-		.expect("event is valid, we just created it"),
-	);
-
-	knock_event_stub
-		.insert("room_id".into(), CanonicalJsonValue::String(room_id.as_str().into()));
-
-	knock_event_stub
-		.insert("state_key".into(), CanonicalJsonValue::String(sender_user.as_str().into()));
-
-	knock_event_stub
-		.insert("sender".into(), CanonicalJsonValue::String(sender_user.as_str().into()));
-
-	knock_event_stub.insert("type".into(), CanonicalJsonValue::String("m.room.member".into()));
-
-	// In order to create a compatible ref hash (EventID) the `hashes` field needs
-	// to be present
-	self.services
-		.server_keys
-		.hash_and_sign_event(&mut knock_event_stub, &room_version_id)?;
-
-	// Generate event id
-	let event_id = gen_event_id(&knock_event_stub, &room_version_id)?;
-
-	// Add event_id
-	knock_event_stub
-		.insert("event_id".into(), CanonicalJsonValue::String(event_id.clone().into()));
-
-	// It has enough fields to be called a proper event now
-	let knock_event = knock_event_stub;
-
-	info!("Asking {remote_server} for send_knock in room {room_id}");
-	let send_knock_request = federation::membership::create_knock_event::v1::Request {
-		room_id: room_id.to_owned(),
-		event_id: event_id.clone(),
-		pdu: self
-			.services
-			.federation
-			.format_pdu_into(knock_event.clone(), Some(&room_version_id))
-			.await,
-	};
-
-	let send_knock_response = self
-		.services
-		.federation
-		.execute(&remote_server, send_knock_request)
+	let (knock_event, event_id) = self
+		.build_knock_event(sender_user, room_id, reason, &make_knock_response, &room_version_id)
 		.await?;
 
-	info!("send_knock finished");
+	let send_knock_response = self
+		.execute_send_knock(&remote_server, room_id, &event_id, &knock_event, &room_version_id)
+		.await?;
 
 	self.services
 		.short
 		.get_or_create_shortroomid(room_id)
 		.await;
 
-	info!("Parsing knock event");
+	self.finalize_knock_membership(
+		room_id,
+		sender_user,
+		&event_id,
+		knock_event,
+		send_knock_response,
+		state_lock,
+	)
+	.await
+}
 
-	let parsed_knock_pdu = PduEvent::from_id_val(&event_id, knock_event.clone())
+#[implement(Service)]
+#[expect(
+	deprecated,
+	reason = "Matrix 1.16 still permits receiving the legacy stripped variant for backwards \
+	          compatibility."
+)]
+async fn finalize_knock_membership(
+	&self,
+	room_id: &RoomId,
+	sender_user: &UserId,
+	event_id: &OwnedEventId,
+	knock_event: CanonicalJsonObject,
+	send_knock_response: federation::membership::create_knock_event::v1::Response,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	info!("Parsing knock event");
+	let parsed_knock_pdu = PduEvent::from_object_and_eventid(event_id, knock_event.clone())
 		.map_err(|e| err!(BadServerResponse("Invalid knock event PDU: {e:?}")))?;
 
 	info!("Updating membership locally to knock state with provided stripped state events");
@@ -350,6 +317,11 @@ async fn knock_room_helper_local(
 }
 
 #[implement(Service)]
+#[expect(
+	deprecated,
+	reason = "Matrix 1.16 still permits receiving the legacy stripped variant for backwards \
+	          compatibility."
+)]
 async fn knock_room_helper_remote(
 	&self,
 	sender_user: &UserId,
@@ -366,7 +338,7 @@ async fn knock_room_helper_remote(
 
 	info!("make_knock finished");
 
-	let room_version_id = make_knock_response.room_version;
+	let room_version_id = make_knock_response.room_version.clone();
 
 	if !self
 		.services
@@ -378,101 +350,13 @@ async fn knock_room_helper_remote(
 		));
 	}
 
-	let mut knock_event_stub: CanonicalJsonObject =
-		serde_json::from_str(make_knock_response.event.get()).map_err(|e| {
-			err!(BadServerResponse("Invalid make_knock event json received from server: {e:?}"))
-		})?;
-
-	knock_event_stub.insert(
-		"origin".into(),
-		CanonicalJsonValue::String(
-			self.services
-				.globals
-				.server_name()
-				.as_str()
-				.to_owned(),
-		),
-	);
-	knock_event_stub.insert(
-		"origin_server_ts".into(),
-		CanonicalJsonValue::Integer(
-			utils::millis_since_unix_epoch()
-				.try_into()
-				.expect("Timestamp is valid js_int value"),
-		),
-	);
-	knock_event_stub.insert(
-		"content".into(),
-		to_canonical_value(RoomMemberEventContent {
-			displayname: self
-				.services
-				.users
-				.displayname(sender_user)
-				.await
-				.ok(),
-			avatar_url: self
-				.services
-				.users
-				.avatar_url(sender_user)
-				.await
-				.ok(),
-			blurhash: self
-				.services
-				.users
-				.blurhash(sender_user)
-				.await
-				.ok(),
-			reason,
-			..RoomMemberEventContent::new(MembershipState::Knock)
-		})
-		.expect("event is valid, we just created it"),
-	);
-
-	knock_event_stub
-		.insert("room_id".into(), CanonicalJsonValue::String(room_id.as_str().into()));
-
-	knock_event_stub
-		.insert("state_key".into(), CanonicalJsonValue::String(sender_user.as_str().into()));
-
-	knock_event_stub
-		.insert("sender".into(), CanonicalJsonValue::String(sender_user.as_str().into()));
-
-	knock_event_stub.insert("type".into(), CanonicalJsonValue::String("m.room.member".into()));
-
-	// In order to create a compatible ref hash (EventID) the `hashes` field needs
-	// to be present
-	self.services
-		.server_keys
-		.hash_and_sign_event(&mut knock_event_stub, &room_version_id)?;
-
-	// Generate event id
-	let event_id = gen_event_id(&knock_event_stub, &room_version_id)?;
-
-	// Add event_id
-	knock_event_stub
-		.insert("event_id".into(), CanonicalJsonValue::String(event_id.clone().into()));
-
-	// It has enough fields to be called a proper event now
-	let knock_event = knock_event_stub;
-
-	info!("Asking {remote_server} for send_knock in room {room_id}");
-	let send_knock_request = federation::membership::create_knock_event::v1::Request {
-		room_id: room_id.to_owned(),
-		event_id: event_id.clone(),
-		pdu: self
-			.services
-			.federation
-			.format_pdu_into(knock_event.clone(), Some(&room_version_id))
-			.await,
-	};
-
-	let send_knock_response = self
-		.services
-		.federation
-		.execute(&remote_server, send_knock_request)
+	let (knock_event, event_id) = self
+		.build_knock_event(sender_user, room_id, reason, &make_knock_response, &room_version_id)
 		.await?;
 
-	info!("send_knock finished");
+	let send_knock_response = self
+		.execute_send_knock(&remote_server, room_id, &event_id, &knock_event, &room_version_id)
+		.await?;
 
 	self.services
 		.short
@@ -480,86 +364,14 @@ async fn knock_room_helper_remote(
 		.await;
 
 	info!("Parsing knock event");
-	let parsed_knock_pdu = PduEvent::from_id_val(&event_id, knock_event.clone())
+	let parsed_knock_pdu = PduEvent::from_object_and_eventid(&event_id, knock_event.clone())
 		.map_err(|e| err!(BadServerResponse("Invalid knock event PDU: {e:?}")))?;
 
-	info!("Going through send_knock response knock state events");
-	let state = send_knock_response
-		.knock_room_state
-		.iter()
-		.map(|event| {
-			serde_json::from_str::<CanonicalJsonObject>(
-				extract_variant!(event.clone(), RawStrippedState::Stripped)
-					.expect("Raw<AnyStrippedStateEvent>")
-					.json()
-					.get(),
-			)
-		})
-		.filter_map(Result::ok);
-
-	let mut state_map: HashMap<u64, OwnedEventId> = HashMap::new();
-
-	for event in state {
-		let Some(state_key) = event.get("state_key") else {
-			debug_warn!("send_knock stripped state event missing state_key: {event:?}");
-			continue;
-		};
-		let Some(event_type) = event.get("type") else {
-			debug_warn!("send_knock stripped state event missing event type: {event:?}");
-			continue;
-		};
-
-		let Ok(state_key) = serde_json::from_value::<String>(state_key.clone().into()) else {
-			debug_warn!("send_knock stripped state event has invalid state_key: {event:?}");
-			continue;
-		};
-		let Ok(event_type) = serde_json::from_value::<StateEventType>(event_type.clone().into())
-		else {
-			debug_warn!("send_knock stripped state event has invalid event type: {event:?}");
-			continue;
-		};
-
-		let event_id = gen_event_id(&event, &room_version_id)?;
-		let shortstatekey = self
-			.services
-			.short
-			.get_or_create_shortstatekey(&event_type, &state_key)
-			.await;
-
-		self.services
-			.timeline
-			.add_pdu_outlier(&event_id, &event);
-
-		state_map.insert(shortstatekey, event_id.clone());
-	}
-
-	info!("Compressing state from send_knock");
-	let compressed: CompressedState = self
-		.services
-		.state_compressor
-		.compress_state_events(
-			state_map
-				.iter()
-				.map(|(ssk, eid)| (ssk, eid.borrow())),
-		)
-		.collect()
-		.await;
-
-	debug!("Saving compressed state");
-	let HashSetCompressStateEvent {
-		shortstatehash: statehash_before_knock,
-		added,
-		removed,
-	} = self
-		.services
-		.state_compressor
-		.save_state(room_id, Arc::new(compressed))
+	let state_map = self
+		.ingest_send_knock_state(&send_knock_response, &room_version_id)
 		.await?;
 
-	debug!("Forcing state for new room");
-	self.services
-		.state
-		.force_state(room_id, statehash_before_knock, added, removed, state_lock)
+	self.apply_send_knock_state(room_id, &state_map, state_lock)
 		.await?;
 
 	let statehash_after_knock = self
@@ -609,6 +421,205 @@ async fn knock_room_helper_remote(
 	self.services
 		.state
 		.set_room_state(room_id, statehash_after_knock, state_lock);
+
+	Ok(())
+}
+
+#[implement(Service)]
+async fn build_knock_event(
+	&self,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	reason: Option<String>,
+	make_knock_response: &federation::membership::prepare_knock_event::v1::Response,
+	room_version_id: &RoomVersionId,
+) -> Result<(CanonicalJsonObject, OwnedEventId)> {
+	let mut knock_event_stub: CanonicalJsonObject =
+		serde_json::from_str(make_knock_response.event.get()).map_err(|e| {
+			err!(BadServerResponse("Invalid make_knock event json received from server: {e:?}"))
+		})?;
+
+	let content = self
+		.build_knock_member_content(sender_user, reason)
+		.await;
+
+	knock_event_stub.insert(
+		"origin".into(),
+		CanonicalJsonValue::String(
+			self.services
+				.globals
+				.server_name()
+				.as_str()
+				.to_owned(),
+		),
+	);
+	knock_event_stub.insert(
+		"origin_server_ts".into(),
+		CanonicalJsonValue::Integer(
+			utils::millis_since_unix_epoch()
+				.try_into()
+				.expect("Timestamp is valid js_int value"),
+		),
+	);
+	knock_event_stub.insert(
+		"content".into(),
+		to_canonical_value(content).expect("event is valid, we just created it"),
+	);
+
+	knock_event_stub
+		.insert("room_id".into(), CanonicalJsonValue::String(room_id.as_str().into()));
+
+	knock_event_stub
+		.insert("state_key".into(), CanonicalJsonValue::String(sender_user.as_str().into()));
+
+	knock_event_stub
+		.insert("sender".into(), CanonicalJsonValue::String(sender_user.as_str().into()));
+
+	knock_event_stub.insert("type".into(), CanonicalJsonValue::String("m.room.member".into()));
+
+	// In order to create a compatible ref hash (EventID) the `hashes` field needs
+	// to be present
+	self.services
+		.server_keys
+		.hash_and_sign_event(&mut knock_event_stub, room_version_id)?;
+
+	let event_id = gen_event_id(&knock_event_stub, room_version_id)?;
+
+	knock_event_stub
+		.insert("event_id".into(), CanonicalJsonValue::String(event_id.clone().into()));
+
+	Ok((knock_event_stub, event_id))
+}
+
+#[implement(Service)]
+async fn execute_send_knock(
+	&self,
+	remote_server: &OwnedServerName,
+	room_id: &RoomId,
+	event_id: &OwnedEventId,
+	knock_event: &CanonicalJsonObject,
+	room_version_id: &RoomVersionId,
+) -> Result<federation::membership::create_knock_event::v1::Response> {
+	info!("Asking {remote_server} for send_knock in room {room_id}");
+	let send_knock_request = federation::membership::create_knock_event::v1::Request {
+		room_id: room_id.to_owned(),
+		event_id: event_id.clone(),
+		pdu: self
+			.services
+			.federation
+			.format_pdu_into(knock_event.clone(), Some(room_version_id))
+			.await,
+	};
+
+	let response = self
+		.services
+		.federation
+		.execute(remote_server, send_knock_request)
+		.await?;
+
+	info!("send_knock finished");
+	Ok(response)
+}
+
+#[implement(Service)]
+#[expect(
+	deprecated,
+	reason = "Matrix 1.16 still permits receiving the legacy stripped variant for backwards \
+	          compatibility."
+)]
+async fn ingest_send_knock_state(
+	&self,
+	send_knock_response: &federation::membership::create_knock_event::v1::Response,
+	room_version_id: &RoomVersionId,
+) -> Result<HashMap<u64, OwnedEventId>> {
+	info!("Going through send_knock response knock state events");
+	let state = send_knock_response
+		.knock_room_state
+		.iter()
+		.map(|event| {
+			serde_json::from_str::<CanonicalJsonObject>(
+				extract_variant!(event.clone(), RawStrippedState::Stripped)
+					.expect("Raw<AnyStrippedStateEvent>")
+					.json()
+					.get(),
+			)
+		})
+		.filter_map(Result::ok);
+
+	let mut state_map: HashMap<u64, OwnedEventId> = HashMap::new();
+
+	for event in state {
+		let Some(state_key) = event.get("state_key") else {
+			debug_warn!("send_knock stripped state event missing state_key: {event:?}");
+			continue;
+		};
+		let Some(event_type) = event.get("type") else {
+			debug_warn!("send_knock stripped state event missing event type: {event:?}");
+			continue;
+		};
+
+		let Ok(state_key) = serde_json::from_value::<String>(state_key.clone().into()) else {
+			debug_warn!("send_knock stripped state event has invalid state_key: {event:?}");
+			continue;
+		};
+		let Ok(event_type) = serde_json::from_value::<StateEventType>(event_type.clone().into())
+		else {
+			debug_warn!("send_knock stripped state event has invalid event type: {event:?}");
+			continue;
+		};
+
+		let event_id = gen_event_id(&event, room_version_id)?;
+		let shortstatekey = self
+			.services
+			.short
+			.get_or_create_shortstatekey(&event_type, &state_key)
+			.await;
+
+		self.services
+			.timeline
+			.add_pdu_outlier(&event_id, &event);
+
+		state_map.insert(shortstatekey, event_id.clone());
+	}
+
+	Ok(state_map)
+}
+
+#[implement(Service)]
+async fn apply_send_knock_state(
+	&self,
+	room_id: &RoomId,
+	state_map: &HashMap<u64, OwnedEventId>,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	info!("Compressing state from send_knock");
+	let compressed: CompressedState = self
+		.services
+		.state_compressor
+		.compress_state_events(
+			state_map
+				.iter()
+				.map(|(ssk, eid)| (ssk, eid.borrow())),
+		)
+		.collect()
+		.await;
+
+	debug!("Saving compressed state");
+	let HashSetCompressStateEvent {
+		shortstatehash: statehash_before_knock,
+		added,
+		removed,
+	} = self
+		.services
+		.state_compressor
+		.save_state(room_id, Arc::new(compressed))
+		.await?;
+
+	debug!("Forcing state for new room");
+	self.services
+		.state
+		.force_state(room_id, statehash_before_knock, added, removed, state_lock)
+		.await?;
 
 	Ok(())
 }

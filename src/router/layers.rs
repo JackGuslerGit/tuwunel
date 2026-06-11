@@ -1,16 +1,23 @@
+#[cfg(test)]
+mod tests;
+
 use std::{any::Any, sync::Arc, time::Duration};
 
 use axum::{
-	Router,
+	Extension, Router,
 	extract::{DefaultBodyLimit, MatchedPath},
 };
-use axum_client_ip::SecureClientIpSource;
 use http::{
 	HeaderValue, Method, StatusCode,
 	header::{self, HeaderName},
 	uri::PathAndQuery,
 };
-use tower::ServiceBuilder;
+use ipnet::IpNet;
+use tower::{
+	ServiceBuilder,
+	layer::util::Identity,
+	util::{Either, option_layer},
+};
 use tower_http::{
 	catch_panic::CatchPanicLayer,
 	cors::{AllowOrigin, CorsLayer},
@@ -20,14 +27,24 @@ use tower_http::{
 	trace::{DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
 use tracing::Level;
-use tuwunel_api::router::state::Guard;
-use tuwunel_core::{Result, Server, debug, error};
+use tuwunel_api::router::{ConfiguredIpSource, TrustedPeerSubnets, state::Guard};
+use tuwunel_core::{Result, Server, config::IpSource, debug, error};
 use tuwunel_service::Services;
 
 use crate::{request, router};
 
 const TUWUNEL_CSP: &[&str; 5] = &[
 	"default-src 'none'",
+	"frame-ancestors 'none'",
+	"form-action 'none'",
+	"base-uri 'none'",
+	"sandbox",
+];
+
+const TUWUNEL_HTML_CSP: &[&str; 7] = &[
+	"default-src 'none'",
+	"script-src 'unsafe-inline'",
+	"style-src 'unsafe-inline'",
 	"frame-ancestors 'none'",
 	"form-action 'none'",
 	"base-uri 'none'",
@@ -61,7 +78,8 @@ pub(crate) fn build(services: &Arc<Services>) -> Result<(Router, Guard)> {
 				.on_response(DefaultOnResponse::new().level(Level::DEBUG)),
 		)
 		.layer(axum::middleware::from_fn_with_state(Arc::clone(services), request::handle))
-		.layer(SecureClientIpSource::ConnectInfo.into_extension())
+		.layer(trusted_peer_subnets_layer(&server.config.ip_source_trusted_subnets))
+		.layer(ip_source_layer(server.config.ip_source))
 		.layer(ResponseBodyTimeoutLayer::new(Duration::from_secs(
 			server.config.client_response_timeout,
 		)))
@@ -95,7 +113,18 @@ pub(crate) fn build(services: &Arc<Services>) -> Result<(Router, Guard)> {
 		))
 		.layer(SetResponseHeaderLayer::if_not_present(
 			header::CONTENT_SECURITY_POLICY,
-			HeaderValue::from_str(&TUWUNEL_CSP.join(";"))?,
+			|res: &http::Response<_>| {
+				let csp = res
+					.headers()
+					.get(header::CONTENT_TYPE)
+					.map(HeaderValue::to_str)
+					.and_then(Result::ok)
+					.is_some_and(|val| val.contains("text/html"))
+					.then(|| TUWUNEL_HTML_CSP.join(";"))
+					.unwrap_or_else(|| TUWUNEL_CSP.join(";"));
+
+				HeaderValue::from_str(&csp).ok()
+			},
 		))
 		.layer(cors_layer(server))
 		.layer(body_limit_layer(server))
@@ -190,6 +219,16 @@ fn cors_layer(server: &Server) -> CorsLayer {
 
 fn body_limit_layer(server: &Server) -> DefaultBodyLimit {
 	DefaultBodyLimit::max(server.config.max_request_size)
+}
+
+fn trusted_peer_subnets_layer(
+	subnets: &[IpNet],
+) -> Either<Extension<TrustedPeerSubnets>, Identity> {
+	option_layer((!subnets.is_empty()).then(|| Extension(TrustedPeerSubnets(Arc::from(subnets)))))
+}
+
+fn ip_source_layer(source: Option<IpSource>) -> Either<Extension<ConfiguredIpSource>, Identity> {
+	option_layer(source.map(|source| Extension(ConfiguredIpSource(source))))
 }
 
 #[tracing::instrument(name = "panic", level = "error", skip_all)]

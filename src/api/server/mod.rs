@@ -1,4 +1,5 @@
 pub(super) mod backfill;
+pub(super) mod edu_types;
 pub(super) mod event;
 pub(super) mod event_auth;
 pub(super) mod get_missing_events;
@@ -18,11 +19,13 @@ pub(super) mod send_knock;
 pub(super) mod send_leave;
 pub(super) mod state;
 pub(super) mod state_ids;
+pub(super) mod timestamp;
 pub(super) mod user;
 pub(super) mod version;
 pub(super) mod well_known;
 
 pub(super) use backfill::*;
+pub(super) use edu_types::*;
 pub(super) use event::*;
 pub(super) use event_auth::*;
 pub(super) use get_missing_events::*;
@@ -42,6 +45,7 @@ pub(super) use send_knock::*;
 pub(super) use send_leave::*;
 pub(super) use state::*;
 pub(super) use state_ids::*;
+pub(super) use timestamp::*;
 pub(super) use user::*;
 pub(super) use version::*;
 pub(super) use well_known::*;

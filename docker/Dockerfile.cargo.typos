@@ -6,20 +6,17 @@ ARG RUSTUP_HOME
 ARG CARGO_HOME
 ARG typos_args=""
 
-WORKDIR /
-COPY --link --from=input . .
-
 WORKDIR /usr/src/tuwunel
-RUN \
---mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
---mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
-<<EOF
+RUN <<EOF
     set -eux
     rustup run ${rust_toolchain} \
         typos \
             --color always \
             --exclude docker \
             --exclude nix \
+            --exclude RELEASE.md \
+            --exclude 'tests/complement/*.jsonl' \
+            --exclude 'tests/playwright/known-failures.txt' \
+            --exclude 'docs/development/compliance/msc.md' \
             ${typos_args}
 EOF

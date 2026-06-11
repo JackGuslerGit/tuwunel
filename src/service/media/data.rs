@@ -22,9 +22,9 @@ pub(crate) struct Data {
 }
 
 #[derive(Debug)]
-pub(super) struct Metadata {
-	pub(super) content_disposition: Option<ContentDisposition>,
-	pub(super) content_type: Option<String>,
+pub struct Metadata {
+	pub content_disposition: Option<ContentDisposition>,
+	pub content_type: Option<String>,
 	pub(super) key: Vec<u8>,
 }
 
@@ -68,11 +68,14 @@ impl Data {
 		let value = (unused_expires_at, user);
 		debug!(?mxc, ?user, ?unused_expires_at, "Inserting pending");
 
-		self.mediaid_pending.put(mxc, value);
+		self.mediaid_pending
+			.raw_put(mxc.to_string(), value);
 	}
 
 	/// Remove a pending MXC URI from the database
-	pub(super) fn remove_pending_mxc(&self, mxc: &Mxc<'_>) { self.mediaid_pending.del(mxc); }
+	pub(super) fn remove_pending_mxc(&self, mxc: &Mxc<'_>) {
+		self.mediaid_pending.remove(&mxc.to_string());
+	}
 
 	/// Count the number of pending MXC URIs for a specific user
 	pub(super) async fn count_pending_mxc_for_user(&self, user_id: &UserId) -> (usize, u64) {
@@ -96,7 +99,7 @@ impl Data {
 		type Value<'a> = (u64, OwnedUserId);
 
 		self.mediaid_pending
-			.qry(mxc)
+			.get(&mxc.to_string())
 			.await
 			.deserialized()
 			.map(|(expires_at, user_id): Value<'_>| (user_id, expires_at))
@@ -153,6 +156,18 @@ impl Data {
 		Ok(keys)
 	}
 
+	pub(super) async fn file_metadata_exists(&self, mxc: &Mxc<'_>, dim: &Dim) -> bool {
+		let dim: &[u32] = &[dim.width, dim.height];
+		let prefix = (mxc, dim, Interfix);
+		let keys = self
+			.mediaid_file
+			.keys_prefix_raw(&prefix)
+			.ignore_err();
+
+		pin_mut!(keys);
+		keys.next().await.is_some()
+	}
+
 	pub(super) async fn search_file_metadata(
 		&self,
 		mxc: &Mxc<'_>,
@@ -188,10 +203,11 @@ impl Data {
 			.filter(|bytes| !bytes.is_empty())
 			.map(string_from_bytes)
 			.transpose()
-			.map_err(|e| err!(Database(error!(?mxc, "Content-type is invalid: {e}"))))?
+			.map_err(|e| err!(Database(error!(?mxc, "Content-disposition is invalid: {e}"))))?
 			.as_deref()
 			.map(str::parse)
-			.transpose()?;
+			.transpose()
+			.map_err(|e| err!(Database(error!(?mxc, "Content-disposition is invalid: {e}"))))?;
 
 		Ok(Metadata { content_disposition, content_type, key })
 	}
@@ -260,6 +276,42 @@ impl Data {
 		value.extend_from_slice(&data.image_width.unwrap_or(0).to_be_bytes());
 		value.push(0xFF);
 		value.extend_from_slice(&data.image_height.unwrap_or(0).to_be_bytes());
+		value.push(0xFF);
+		value.extend_from_slice(
+			data.video
+				.as_ref()
+				.map(String::as_bytes)
+				.unwrap_or_default(),
+		);
+		value.push(0xFF);
+		value.extend_from_slice(&data.video_size.unwrap_or(0).to_be_bytes());
+		value.push(0xFF);
+		value.extend_from_slice(&data.video_width.unwrap_or(0).to_be_bytes());
+		value.push(0xFF);
+		value.extend_from_slice(&data.video_height.unwrap_or(0).to_be_bytes());
+		value.push(0xFF);
+		value.extend_from_slice(
+			data.audio
+				.as_ref()
+				.map(String::as_bytes)
+				.unwrap_or_default(),
+		);
+		value.push(0xFF);
+		value.extend_from_slice(&data.audio_size.unwrap_or(0).to_be_bytes());
+		value.push(0xFF);
+		value.extend_from_slice(
+			data.og_type
+				.as_ref()
+				.map(String::as_bytes)
+				.unwrap_or_default(),
+		);
+		value.push(0xFF);
+		value.extend_from_slice(
+			data.og_url
+				.as_ref()
+				.map(String::as_bytes)
+				.unwrap_or_default(),
+		);
 
 		self.url_previews.insert(url.as_bytes(), &value);
 
@@ -320,6 +372,62 @@ impl Data {
 			| Some(0) => None,
 			| x => x,
 		};
+		let video = match values
+			.next()
+			.and_then(|b| String::from_utf8(b.to_vec()).ok())
+		{
+			| Some(s) if s.is_empty() => None,
+			| x => x,
+		};
+		let video_size = match values
+			.next()
+			.map(|b| usize::from_be_bytes(b.try_into().unwrap_or_default()))
+		{
+			| Some(0) => None,
+			| x => x,
+		};
+		let video_width = match values
+			.next()
+			.map(|b| u32::from_be_bytes(b.try_into().unwrap_or_default()))
+		{
+			| Some(0) => None,
+			| x => x,
+		};
+		let video_height = match values
+			.next()
+			.map(|b| u32::from_be_bytes(b.try_into().unwrap_or_default()))
+		{
+			| Some(0) => None,
+			| x => x,
+		};
+		let audio = match values
+			.next()
+			.and_then(|b| String::from_utf8(b.to_vec()).ok())
+		{
+			| Some(s) if s.is_empty() => None,
+			| x => x,
+		};
+		let audio_size = match values
+			.next()
+			.map(|b| usize::from_be_bytes(b.try_into().unwrap_or_default()))
+		{
+			| Some(0) => None,
+			| x => x,
+		};
+		let og_type = match values
+			.next()
+			.and_then(|b| String::from_utf8(b.to_vec()).ok())
+		{
+			| Some(s) if s.is_empty() => None,
+			| x => x,
+		};
+		let og_url = match values
+			.next()
+			.and_then(|b| String::from_utf8(b.to_vec()).ok())
+		{
+			| Some(s) if s.is_empty() => None,
+			| x => x,
+		};
 
 		Ok(UrlPreviewData {
 			title,
@@ -328,6 +436,14 @@ impl Data {
 			image_size,
 			image_width,
 			image_height,
+			video,
+			video_size,
+			video_width,
+			video_height,
+			audio,
+			audio_size,
+			og_type,
+			og_url,
 		})
 	}
 }

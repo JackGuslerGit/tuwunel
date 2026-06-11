@@ -74,7 +74,9 @@ zstd_compression = [
 ]
 
 [dependencies]
+async-trait.workspace = true
 base64.workspace = true
+bytes.workspace = true
 clap.workspace = true
 tuwunel-core.workspace = true
 tuwunel-database.workspace = true
@@ -82,8 +84,10 @@ tuwunel-macros.workspace = true
 tuwunel-service.workspace = true
 const-str.workspace = true
 ctor.workspace = true
+dtor.workspace = true
 futures.workspace = true
 log.workspace = true
+regex.workspace = true
 ruma.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -91,6 +95,7 @@ serde_yaml.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [lints]
 workspace = true

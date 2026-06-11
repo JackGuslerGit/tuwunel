@@ -42,7 +42,8 @@ running compaction is not recommended, or compaction via a timer, due to
 creating unnecessary I/O amplification. RocksDB is built with io_uring support
 via liburing for improved read performance.
 
-RocksDB troubleshooting can be found [in the RocksDB section of troubleshooting](troubleshooting.md).
+RocksDB troubleshooting can be found
+[in the RocksDB section of troubleshooting](troubleshooting.md#rocksdb--database-issues).
 
 ### Compression
 
@@ -57,10 +58,49 @@ to ensure no additional filesystem compression takes place as this can render
 unbuffered Direct IO inoperable, significantly slowing down read and write
 performance. See <https://btrfs.readthedocs.io/en/latest/Compression.html#compatibility>
 
+> [!IMPORTANT]
 > Compression is done using the COW mechanism so it’s incompatible with
 > nodatacow. Direct IO read works on compressed files but will fall back to
 > buffered writes and leads to no compression even if force compression is set.
 > Currently nodatasum and compression don’t work together.
+
+### ZFS
+
+ZFS has several quirks that interact badly with RocksDB defaults. Apply both
+the Tuwunel config changes and the dataset properties below.
+
+In `tuwunel.toml`:
+
+- `rocksdb_direct_io = false`. OpenZFS prior to 2.3 silently ignored
+  `O_DIRECT` and fell back to buffered. OpenZFS 2.3+ honors `O_DIRECT` only
+  when requests are page-aligned and a multiple of the recordsize, which
+  RocksDB cannot guarantee.
+- `rocksdb_allow_fallocate = false`. OpenZFS does not implement
+  `fallocate(2)` preallocation; only `FALLOC_FL_PUNCH_HOLE` and
+  `FALLOC_FL_ZERO_RANGE` are supported.
+- Leave `rocksdb_optimize_for_spinning_disks = false` on NVMe or SSD pools,
+  even when running on ZFS.
+
+On the dataset hosting `database_path`:
+
+| Property | Value | Reason |
+|---|---|---|
+| `recordsize` | `128K` (or `64K`) | Match RocksDB's working set. `16K` causes severe write amplification on compaction. |
+| `primarycache` | `metadata` | Tuwunel's block cache already serves data; ARC caching of data duplicates RAM. |
+| `compression` | `off` | RocksDB SSTs are already zstd-compressed by Tuwunel. |
+| `atime` | `off` | Avoid an FS write per read. |
+| `logbias` | `throughput` | Route ZIL through the normal txg path, which suits append-only WAL traffic. |
+
+`recordsize` takes effect only on files written after the property is
+changed. After adjusting it, dump the database (offline copy out, wipe the
+dataset, copy back) so existing SSTs adopt the new recordsize. Without a
+dump-and-reload, compaction will gradually rewrite into the new recordsize
+over weeks; pre-existing files keep the old size in the meantime.
+
+For sync write latency, in order of preference: a separate SLOG vdev, then
+`logbias=throughput`, then `sync=disabled` (only if you accept that a host
+crash may discard the WAL tail; Tuwunel recovers cleanly from this via
+`rocksdb_recovery_mode=1`, the default).
 
 ### Files in database
 
@@ -76,15 +116,19 @@ useless for average users unless troubleshooting something low-level. If you
 would like to store nearly none at all, see the `rocksdb_max_log_files`
 config option.
 
-## Backups
+### Online backups
 
 Currently only RocksDB supports online backups. If you'd like to backup your
 database online without any downtime, see the `!admin server` command for the
 backup commands and the `database_backup_path` config options in the example
-config. Please note that the format of the database backup is not the exact
-same. This is unfortunately a bad design choice by Facebook as we are using the
-database backup engine API from RocksDB, however the data is still there and can
-still be joined together.
+config.
+
+Please note that the format of the database backup is not the exact same. This is
+unfortunately a bad design choice by Facebook as we are using the database backup
+engine API from RocksDB, however the data is still there and can still be joined
+together.
+
+#### Restoring online backup
 
 To restore a backup from an online RocksDB backup:
 
@@ -100,6 +144,8 @@ if you have multiple) to your new directory
 - set your `database_path` config option to your new directory, or replace your
 old one with the new one you crafted
 - start up Tuwunel again and it should open as normal
+
+### Offline backups
 
 If you'd like to do an offline backup, shutdown Tuwunel and copy your
 `database_path` directory elsewhere. This can be restored with no modifications

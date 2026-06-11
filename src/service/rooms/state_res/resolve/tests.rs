@@ -62,7 +62,7 @@ async fn test_event_sort() {
 	// don't remove any events so we know it sorts them all correctly
 	let mut events_to_sort = events.keys().cloned().collect::<Vec<_>>();
 
-	events_to_sort.shuffle(&mut rand::thread_rng());
+	events_to_sort.shuffle(&mut rand::rng());
 
 	let power_level = resolved_power
 		.get(&(StateEventType::RoomPowerLevels, "".into()))
@@ -500,7 +500,7 @@ async fn test_reverse_topological_power_sort() {
 		event_id("p") => [event_id("o")].into_iter().collect(),
 	};
 
-	let res = super::super::topological_sort(&graph, &async |_id| {
+	let res = super::super::topological_sort(graph, &async |_id| {
 		Ok((int!(0).into(), MilliSecondsSinceUnixEpoch(uint!(0))))
 	})
 	.await
@@ -508,6 +508,34 @@ async fn test_reverse_topological_power_sort() {
 
 	assert_eq!(
 		vec!["o", "l", "n", "m", "p"],
+		res.iter()
+			.map(ToString::to_string)
+			.map(|s| s.replace('$', "").replace(":foo", ""))
+			.collect::<Vec<_>>()
+	);
+}
+
+#[tokio::test]
+#[expect(
+	clippy::iter_on_single_items,
+	clippy::iter_on_empty_collections
+)]
+async fn topological_sort_dangling_references() {
+	// A dangling reference (absent "x") must not drop "a" or its dependent "b".
+	let graph = hashmap! {
+		event_id("a") => [event_id("x")].into_iter().collect(),
+		event_id("b") => [event_id("a")].into_iter().collect(),
+		event_id("c") => [].into_iter().collect(),
+	};
+
+	let res = super::super::topological_sort(graph, &async |_id| {
+		Ok((int!(0).into(), MilliSecondsSinceUnixEpoch(uint!(0))))
+	})
+	.await
+	.unwrap();
+
+	assert_eq!(
+		vec!["a", "b", "c"],
 		res.iter()
 			.map(ToString::to_string)
 			.map(|s| s.replace('$', "").replace(":foo", ""))
@@ -840,4 +868,171 @@ async fn split_conflicted_state_set_mixed() {
 		StateEventType::RoomMember => "@b:hs1" => once(1).collect(),
 		StateEventType::RoomMember => "@c:hs1" => once(2).collect(),
 	],);
+}
+
+// `auth_difference` returns events in fewer than every input chain
+// (∪Cᵢ - ∩Cᵢ), per the v2 state-res spec.
+
+fn auth_set(ids: &[&str]) -> super::AuthSet<OwnedEventId> {
+	ids.iter().copied().map(event_id).collect()
+}
+
+async fn auth_difference_result(sets: Vec<super::AuthSet<OwnedEventId>>) -> Vec<OwnedEventId> {
+	let mut out: Vec<OwnedEventId> =
+		super::auth_difference::auth_difference(sets.into_iter().stream())
+			.collect()
+			.await;
+	out.sort();
+	out
+}
+
+#[tokio::test]
+async fn auth_difference_three_sets_partial_overlap() {
+	// `a` is in all three sets so it is excluded; the other three are each
+	// missing from one set so they make up the difference.
+	let result = auth_difference_result(vec![
+		auth_set(&["a", "b", "c"]),
+		auth_set(&["a", "b", "d"]),
+		auth_set(&["a", "c", "d"]),
+	])
+	.await;
+
+	assert_eq!(result, vec![event_id("b"), event_id("c"), event_id("d")]);
+}
+
+#[tokio::test]
+async fn auth_difference_three_sets_full_overlap() {
+	let result =
+		auth_difference_result(vec![auth_set(&["a"]), auth_set(&["a"]), auth_set(&["a"])]).await;
+
+	assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn auth_difference_two_sets() {
+	let result = auth_difference_result(vec![auth_set(&["a", "b"]), auth_set(&["a", "c"])]).await;
+
+	assert_eq!(result, vec![event_id("b"), event_id("c")]);
+}
+
+#[tokio::test]
+async fn auth_difference_no_sets() {
+	let result = auth_difference_result(vec![]).await;
+
+	assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn auth_difference_single_set() {
+	let result = auth_difference_result(vec![auth_set(&["a", "b", "c"])]).await;
+
+	assert!(result.is_empty());
+}
+
+// `mainline_sort`: events with no power-levels ancestor in their auth chain
+// must sort before events whose deepest power-levels ancestor is the oldest
+// in the mainline. Pre-fix the two classes shared sort key 0 and tiebroke on
+// origin_server_ts.
+
+#[tokio::test]
+async fn mainline_sort_no_pl_ancestor_sorts_first() {
+	let _guard = tracing::subscriber::set_default(
+		tracing_subscriber::fmt()
+			.with_test_writer()
+			.finish(),
+	);
+
+	let create = to_init_pdu_event(
+		"CREATE",
+		alice(),
+		TimelineEventType::RoomCreate,
+		Some(""),
+		to_raw_json_value(&json!({ "creator": alice() })).unwrap(),
+	);
+
+	let pl1 = to_pdu_event(
+		"PL1",
+		alice(),
+		TimelineEventType::RoomPowerLevels,
+		Some(""),
+		to_raw_json_value(&json!({ "users": { alice(): 100 } })).unwrap(),
+		&["CREATE"],
+		&["CREATE"],
+	);
+
+	let pl2 = to_pdu_event(
+		"PL2",
+		alice(),
+		TimelineEventType::RoomPowerLevels,
+		Some(""),
+		to_raw_json_value(&json!({ "users": { alice(): 100 } })).unwrap(),
+		&["CREATE", "PL1"],
+		&["PL1"],
+	);
+
+	let pl3 = to_pdu_event(
+		"PL3",
+		alice(),
+		TimelineEventType::RoomPowerLevels,
+		Some(""),
+		to_raw_json_value(&json!({ "users": { alice(): 100 } })).unwrap(),
+		&["CREATE", "PL2"],
+		&["PL2"],
+	);
+
+	// Event whose deepest PL ancestor is the oldest mainline PL.
+	let oldest_rooted = to_pdu_event(
+		"OLDEST_ROOTED",
+		alice(),
+		TimelineEventType::RoomMessage,
+		None,
+		to_raw_json_value(&json!({})).unwrap(),
+		&["CREATE", "PL1"],
+		&["PL1"],
+	);
+
+	// Event whose deepest PL ancestor is the current mainline PL.
+	let current_rooted = to_pdu_event(
+		"CURRENT_ROOTED",
+		alice(),
+		TimelineEventType::RoomMessage,
+		None,
+		to_raw_json_value(&json!({})).unwrap(),
+		&["CREATE", "PL3"],
+		&["PL3"],
+	);
+
+	// Event with no PL in its auth chain.
+	let no_pl = to_pdu_event(
+		"NO_PL",
+		alice(),
+		TimelineEventType::RoomMessage,
+		None,
+		to_raw_json_value(&json!({})).unwrap(),
+		&["CREATE"],
+		&["CREATE"],
+	);
+
+	let events: HashMap<OwnedEventId, PduEvent> =
+		[&create, &pl1, &pl2, &pl3, &oldest_rooted, &current_rooted, &no_pl]
+			.into_iter()
+			.cloned()
+			.map(|e| (e.event_id().to_owned(), e))
+			.collect();
+
+	let to_sort = [event_id("OLDEST_ROOTED"), event_id("CURRENT_ROOTED"), event_id("NO_PL")];
+
+	let sorted = super::mainline_sort(
+		Some(event_id("PL3")),
+		to_sort.iter().map(AsRef::as_ref).stream(),
+		&async |id| events.get(&id).cloned().ok_or_else(not_found),
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(sorted, vec![
+		event_id("NO_PL"),
+		event_id("OLDEST_ROOTED"),
+		event_id("CURRENT_ROOTED"),
+	]);
 }

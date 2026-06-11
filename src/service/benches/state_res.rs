@@ -1,5 +1,4 @@
 #![cfg(test)]
-#![allow(unused_features)] // 1.96.0-nightly 2026-03-07 bug
 
 use std::{
 	borrow::Borrow,
@@ -28,7 +27,7 @@ use tuwunel_core::{
 	matrix::{Event, EventHash, PduEvent, event::TypeExt},
 	utils::stream::IterStream,
 };
-use tuwunel_service::rooms::state_res::{AuthSet, StateMap};
+use tuwunel_service::rooms::state_res::{AuthSet, StateMap, topological_sort};
 
 criterion_group!(
 	benches,
@@ -58,7 +57,7 @@ fn lexico_topo_sort(c: &mut Criterion) {
 		};
 
 		c.to_async(FuturesExecutor).iter(async || {
-			_ = tuwunel_service::rooms::state_res::topological_sort(&graph, &async |_id| {
+			_ = topological_sort(graph.clone(), &async |_id| {
 				Ok((int!(0).into(), MilliSecondsSinceUnixEpoch(uint!(0))))
 			})
 			.await;
@@ -452,7 +451,7 @@ where
 		origin_server_ts: ts.try_into().unwrap(),
 		state_key: state_key.map(Into::into),
 		kind: ev_type,
-		content,
+		content: content.into(),
 		redacts: None,
 		unsigned: None,
 		auth_events,

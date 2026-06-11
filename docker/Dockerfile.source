@@ -1,17 +1,8 @@
 # syntax = docker/dockerfile:1.11-labs
 
 FROM input AS source
-ARG git_checkout
 
-ADD --link --keep-git-dir . /usr/src/tuwunel
-WORKDIR /usr/src/tuwunel
-RUN <<EOF
-    set -eux
-    git reset \
-        --hard \
-        --no-recurse-submodules \
-        ${git_checkout}
-EOF
+ADD --link . /usr/src/tuwunel
 
 
 FROM input AS ingredients
@@ -42,13 +33,6 @@ RUN \
 --mount=type=cache,dst=${CARGO_HOME}/git,sharing=locked \
 <<EOF
     set -eux
-    git submodule update \
-        --remote \
-        --no-fetch \
-        --recursive \
-        --checkout \
-        --init
-
     rustup run ${rust_toolchain} \
         cargo fetch \
             --locked \
@@ -74,12 +58,8 @@ RUN \
         cargo chef prepare \
             --recipe-path recipe.json
 
-    manifest="Cargo.toml"
-    package="rust-librocksdb-sys"
-    cmd="cargo tree --manifest-path ${manifest} -f {r} -p ${package}"
-    url="$(rustup run ${rust_toolchain} ${cmd} | head -n 1)"
-    url="https://github.com/matrix-construct/rust-rocksdb" #TODO fixme
-    echo "$url" > rocksdb.url
+    #TODO: derive from `cargo tree -f {r} -p rust-librocksdb-sys`
+    echo "https://github.com/matrix-construct/rust-rocksdb" > rocksdb.url
 
     sha1sum recipe.json rocksdb.url
 EOF
@@ -88,5 +68,5 @@ EOF
 FROM scratch AS recipe
 
 WORKDIR /
-COPY --from=preparing /usr/src/tuwunel/recipe.json .
-COPY --from=preparing /usr/src/tuwunel/rocksdb.url .
+COPY --link --from=preparing /usr/src/tuwunel/recipe.json .
+COPY --link --from=preparing /usr/src/tuwunel/rocksdb.url .

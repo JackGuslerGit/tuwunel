@@ -1,9 +1,19 @@
 #![expect(rustdoc::broken_intra_doc_links)]
-mod commands;
+mod delete;
+mod delete_all_from_server;
+mod delete_all_from_user;
+mod delete_by_event;
+mod delete_list;
+mod delete_range;
+mod get_file_info;
+mod get_remote_file;
+mod get_remote_thumbnail;
+mod preview;
 
 use clap::Subcommand;
 use ruma::{OwnedEventId, OwnedMxcUri, OwnedServerName};
 use tuwunel_core::Result;
+use url::Url;
 
 use crate::admin_command_dispatch;
 
@@ -30,20 +40,19 @@ pub(super) enum MediaCommand {
 	DeleteList,
 
 	/// - Deletes all remote (and optionally local) media created before or
-	///   after [duration] time using filesystem metadata first created at date,
-	///   or fallback to last modified date. This will always ignore errors by
-	///   default.
-	DeletePastRemoteMedia {
+	///   after [duration] time using filesystem metadata last modified at date.
+	//    This will always ignore errors by default.
+	DeleteRange {
 		/// - The relative time (e.g. 30s, 5m, 7d) within which to search
 		duration: String,
 
 		/// - Only delete media created before [duration] ago
 		#[arg(long, short)]
-		before: bool,
+		older_than: bool,
 
 		/// - Only delete media created after [duration] ago
 		#[arg(long, short)]
-		after: bool,
+		newer_than: bool,
 
 		/// - Long argument to additionally delete local media
 		#[arg(long)]
@@ -97,5 +106,13 @@ pub(super) enum MediaCommand {
 
 		#[arg(long, default_value("800"))]
 		height: u32,
+	},
+
+	Preview {
+		url: Url,
+
+		/// Bypass cache
+		#[arg(short, long)]
+		no_cache: bool,
 	},
 }

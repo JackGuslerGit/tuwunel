@@ -57,14 +57,19 @@ impl crate::Service for Service {
 		self.unset_all_presence().await;
 		self.device_presence.clear().await;
 		_ = self
-			.maybe_ping_presence(&self.services.globals.server_user, None, &PresenceState::Online)
+			.maybe_ping_presence(
+				&self.services.globals.server_user,
+				None,
+				None,
+				&PresenceState::Online,
+			)
 			.await;
 
 		let receiver = self.timer_channel.1.clone();
 
 		let mut presence_timers: FuturesUnordered<_> = FuturesUnordered::new();
 		let mut timer_handles: HashMap<OwnedUserId, (u64, AbortHandle)> = HashMap::new();
-		while !receiver.is_closed() && self.services.server.running() {
+		while !receiver.is_closed() && self.services.server.is_running() {
 			tokio::select! {
 				Some(result) = presence_timers.next() => {
 					let Ok((user_id, count)) = result else {
@@ -81,7 +86,6 @@ impl crate::Service for Service {
 					self.process_presence_timer(&user_id, count).await.log_err().ok();
 				},
 				event = receiver.recv_async() => match event {
-					Err(_) => break,
 					Ok((user_id, timeout, count)) => {
 						debug!(
 							"Adding timer {}: {user_id} timeout:{timeout:?} count:{count}",
@@ -98,6 +102,7 @@ impl crate::Service for Service {
 						));
 						timer_handles.insert(user_id, (count, handle));
 					},
+					_ => break,
 				},
 			}
 		}
@@ -106,6 +111,7 @@ impl crate::Service for Service {
 		_ = self
 			.maybe_ping_presence(
 				&self.services.globals.server_user,
+				None,
 				None,
 				&PresenceState::Offline,
 			)

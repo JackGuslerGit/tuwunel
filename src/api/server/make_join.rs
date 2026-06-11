@@ -2,7 +2,10 @@ use axum::extract::State;
 use futures::{StreamExt, TryFutureExt, pin_mut};
 use ruma::{
 	OwnedUserId, RoomId, RoomVersionId, UserId,
-	api::{client::error::ErrorKind, federation::membership::prepare_join_event},
+	api::{
+		error::{ErrorKind, IncompatibleRoomVersionErrorData},
+		federation::membership::prepare_join_event,
+	},
 	events::{
 		StateEventType,
 		room::{
@@ -42,8 +45,7 @@ pub(crate) async fn create_join_event_template_route(
 	if let Some(server) = body.room_id.server_name()
 		&& services
 			.config
-			.forbidden_remote_server_names
-			.is_match(server.host())
+			.is_forbidden_remote_server_name(server)
 	{
 		return Err!(Request(Forbidden(warn!(
 			"Room ID server name {server} is banned on this homeserver."
@@ -57,7 +59,9 @@ pub(crate) async fn create_join_event_template_route(
 
 	if !body.ver.contains(&room_version_id) {
 		return Err(Error::BadRequest(
-			ErrorKind::IncompatibleRoomVersion { room_version: room_version_id },
+			ErrorKind::IncompatibleRoomVersion(IncompatibleRoomVersionErrorData::new(
+				room_version_id,
+			)),
 			"Room version not supported.",
 		));
 	}
@@ -156,7 +160,7 @@ pub(crate) async fn user_can_perform_restricted_join(
 		.is_invited(user_id, room_id)
 		.await
 	{
-		return Ok(true);
+		return Ok(false);
 	}
 
 	let Ok(join_rules_event_content) = services

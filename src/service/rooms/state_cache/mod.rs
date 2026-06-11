@@ -13,9 +13,7 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Result, implement,
-	result::LogErr,
-	trace,
+	Result, implement, trace,
 	utils::{
 		self, BoolExt,
 		future::OptionStream,
@@ -97,19 +95,10 @@ pub async fn appservice_in_room(&self, room_id: &RoomId, appservice: &Registrati
 		return cached;
 	}
 
-	let bridge_user_id = UserId::parse_with_server_name(
-		appservice.registration.sender_localpart.as_str(),
-		self.services.globals.server_name(),
-	);
-
-	let Ok(bridge_user_id) = bridge_user_id.log_err() else {
-		return false;
-	};
-
-	let in_room = self.is_joined(&bridge_user_id, room_id).await
+	let in_room = self.is_joined(&appservice.sender, room_id).await
 		|| self
 			.room_members(room_id)
-			.ready_any(|user_id| appservice.users.is_match(user_id.as_str()))
+			.ready_any(|user_id| appservice.is_user_match(user_id))
 			.await;
 
 	self.appservice_in_room_cache
@@ -207,8 +196,8 @@ pub fn get_shared_rooms<'a>(
 	user_a: &'a UserId,
 	user_b: &'a UserId,
 ) -> impl Stream<Item = &RoomId> + Send + 'a {
-	let a = self.rooms_joined(user_a).boxed();
-	let b = self.rooms_joined(user_b).boxed();
+	let a = self.rooms_joined(user_a);
+	let b = self.rooms_joined(user_b);
 
 	utils::set::intersection_sorted_stream2(a, b)
 }

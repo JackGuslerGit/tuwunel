@@ -2,11 +2,13 @@ use ruma::{
 	events::{
 		TimelineEventType,
 		room::{
-			aliases::RoomAliasesEventContent, message::RoomMessageEventContent,
+			join_rules::{JoinRule, Restricted, RoomJoinRulesEventContent},
+			member::{MembershipState, RoomMemberEventContent},
+			message::RoomMessageEventContent,
 			redaction::RoomRedactionEventContent,
 		},
 	},
-	int, owned_event_id, owned_room_alias_id, owned_room_id,
+	int, owned_event_id, owned_room_id,
 	room_version_rules::{AuthorizationRules, RoomVersionRules},
 	uint, user_id,
 };
@@ -14,7 +16,7 @@ use serde_json::{json, value::to_raw_value as to_raw_json_value};
 
 mod room_power_levels;
 
-use tuwunel_core::matrix::{EventHash, PduEvent, StateKey};
+use tuwunel_core::matrix::{Event, EventHash, PduEvent, StateKey};
 
 use self::room_power_levels::default_room_power_levels;
 use super::{
@@ -25,7 +27,7 @@ use super::{
 		INITIAL_EVENTS, INITIAL_HYDRA_EVENTS, TestStateMap, alice, charlie, ella, event_id,
 		init_subscriber, member_content_join, not_found, room_create_hydra_pdu_event, room_id,
 		room_redaction_pdu_event, room_third_party_invite, to_hydra_pdu_event, to_init_pdu_event,
-		to_pdu_event,
+		to_pdu_event, zara,
 	},
 };
 
@@ -386,104 +388,8 @@ async fn no_federate_same_server() {
 		.unwrap();
 }
 
-#[tokio::test]
-async fn room_aliases_no_state_key() {
-	let _guard = init_subscriber();
-
-	let incoming_event = to_pdu_event(
-		"ALIASES",
-		alice(),
-		TimelineEventType::RoomAliases,
-		None,
-		to_raw_json_value(&RoomAliasesEventContent::new(vec![
-			owned_room_alias_id!("#room:foo"),
-			owned_room_alias_id!("#room_alt:foo"),
-		]))
-		.unwrap(),
-		&["CREATE", "IJR", "IPOWER"],
-		&["IMB"],
-	);
-
-	let init_events = INITIAL_EVENTS();
-	let auth_events = TestStateMap::new(&init_events);
-	let fetch_state = auth_events.fetch_state_fn();
-
-	// Cannot accept `m.room.aliases` without state key.
-	check_state_dependent_auth_rules(&RoomVersionRules::V3, &incoming_event, &fetch_state)
-		.await
-		.unwrap_err();
-
-	// `m.room.aliases` is not checked since v6.
-	check_state_dependent_auth_rules(&RoomVersionRules::V8, &incoming_event, &fetch_state)
-		.await
-		.unwrap();
-}
-
-#[tokio::test]
-async fn room_aliases_other_server() {
-	let _guard = init_subscriber();
-
-	let incoming_event = to_pdu_event(
-		"ALIASES",
-		alice(),
-		TimelineEventType::RoomAliases,
-		Some("bar"),
-		to_raw_json_value(&RoomAliasesEventContent::new(vec![
-			owned_room_alias_id!("#room:bar"),
-			owned_room_alias_id!("#room_alt:bar"),
-		]))
-		.unwrap(),
-		&["CREATE", "IJR", "IPOWER"],
-		&["IMB"],
-	);
-
-	let init_events = INITIAL_EVENTS();
-	let auth_events = TestStateMap::new(&init_events);
-	let fetch_state = auth_events.fetch_state_fn();
-
-	// Cannot accept `m.room.aliases` with different server name than sender.
-	check_state_dependent_auth_rules(&RoomVersionRules::V3, &incoming_event, &fetch_state)
-		.await
-		.unwrap_err();
-
-	// `m.room.aliases` is not checked since v6.
-	check_state_dependent_auth_rules(&RoomVersionRules::V8, &incoming_event, &fetch_state)
-		.await
-		.unwrap();
-}
-
-#[tokio::test]
-async fn room_aliases_same_server() {
-	let _guard = init_subscriber();
-
-	let incoming_event = to_pdu_event(
-		"ALIASES",
-		alice(),
-		TimelineEventType::RoomAliases,
-		Some("foo"),
-		to_raw_json_value(&RoomAliasesEventContent::new(vec![
-			owned_room_alias_id!("#room:foo"),
-			owned_room_alias_id!("#room_alt:foo"),
-		]))
-		.unwrap(),
-		&["CREATE", "IJR", "IPOWER"],
-		&["IMB"],
-	);
-
-	let init_events = INITIAL_EVENTS();
-	let auth_events = TestStateMap::new(&init_events);
-	let fetch_state = auth_events.fetch_state_fn();
-
-	// Accept `m.room.aliases` with same server name as sender.
-	check_state_dependent_auth_rules(&RoomVersionRules::V3, &incoming_event, &fetch_state)
-		.await
-		.unwrap();
-
-	// `m.room.aliases` is not checked since v6.
-	check_state_dependent_auth_rules(&RoomVersionRules::V8, &incoming_event, &fetch_state)
-		.await
-		.unwrap();
-}
+// `m.room.aliases` event type and content removed from ruma upstream;
+// pre-v6 alias auth-rule tests are no longer expressible.
 
 #[tokio::test]
 async fn sender_not_in_room() {
@@ -667,7 +573,7 @@ async fn auth_event_in_different_room() {
 		origin_server_ts: uint!(3),
 		state_key: Some(StateKey::new()),
 		kind: TimelineEventType::RoomPowerLevels,
-		content: to_raw_json_value(&json!({ "users": { alice(): 100 } })).unwrap(),
+		content: json!({ "users": { alice(): 100 } }).into(),
 		redacts: None,
 		unsigned: None,
 		auth_events: vec![event_id("CREATE"), event_id("IMA")].into(),
@@ -806,7 +712,7 @@ async fn rejected_auth_event() {
 		origin_server_ts: uint!(3),
 		state_key: Some(StateKey::new()),
 		kind: TimelineEventType::RoomPowerLevels,
-		content: to_raw_json_value(&json!({ "users": { alice(): 100 } })).unwrap(),
+		content: json!({ "users": { alice(): 100 } }).into(),
 		redacts: None,
 		unsigned: None,
 		auth_events: vec![event_id("CREATE"), event_id("IMA")].into(),
@@ -892,7 +798,9 @@ async fn event_without_room_id() {
 		origin_server_ts: uint!(3),
 		state_key: None,
 		kind: TimelineEventType::RoomMessage,
-		content: to_raw_json_value(&RoomMessageEventContent::text_plain("Hi!")).unwrap(),
+		content: to_raw_json_value(&RoomMessageEventContent::text_plain("Hi!"))
+			.unwrap()
+			.into(),
 		redacts: None,
 		unsigned: None,
 		auth_events: [
@@ -1022,6 +930,81 @@ async fn missing_room_create_in_fetch_event() {
 }
 
 #[tokio::test]
+async fn v12_additional_creator_cannot_bootstrap_join() {
+	let _guard = init_subscriber();
+
+	let create_content = json!({
+		"room_version": "12",
+		"additional_creators": ["@charlie:foo"],
+	});
+
+	let create = room_create_hydra_pdu_event(
+		"CREATE",
+		alice(),
+		to_raw_json_value(&create_content).unwrap(),
+	);
+
+	let charlie_join = to_hydra_pdu_event::<&str>(
+		"CHARLIE_JOIN",
+		charlie(),
+		TimelineEventType::RoomMember,
+		Some(charlie().as_str()),
+		member_content_join(),
+		&[],
+		&["CREATE"],
+	);
+
+	let mut init_events: std::collections::HashMap<ruma::OwnedEventId, PduEvent> =
+		std::collections::HashMap::new();
+	init_events.insert(create.event_id().to_owned(), create);
+	init_events.insert(charlie_join.event_id().to_owned(), charlie_join.clone());
+
+	let auth_events = TestStateMap::new(&init_events);
+	let fetch_state = auth_events.fetch_state_fn();
+
+	check_state_dependent_auth_rules(&RoomVersionRules::V12, &charlie_join, &fetch_state)
+		.await
+		.unwrap_err();
+}
+
+#[tokio::test]
+async fn v12_create_sender_can_bootstrap_join() {
+	let _guard = init_subscriber();
+
+	let create_content = json!({
+		"room_version": "12",
+	});
+
+	let create = room_create_hydra_pdu_event(
+		"CREATE",
+		alice(),
+		to_raw_json_value(&create_content).unwrap(),
+	);
+
+	let alice_join = to_hydra_pdu_event::<&str>(
+		"ALICE_JOIN",
+		alice(),
+		TimelineEventType::RoomMember,
+		Some(alice().as_str()),
+		member_content_join(),
+		&[],
+		&["CREATE"],
+	);
+
+	let mut init_events: std::collections::HashMap<ruma::OwnedEventId, PduEvent> =
+		std::collections::HashMap::new();
+	init_events.insert(create.event_id().to_owned(), create);
+	init_events.insert(alice_join.event_id().to_owned(), alice_join.clone());
+
+	let auth_events = TestStateMap::new(&init_events);
+	let fetch_state = auth_events.fetch_state_fn();
+
+	check_state_dependent_auth_rules(&RoomVersionRules::V12, &alice_join, &fetch_state)
+		.await
+		.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "PduEvent::rejected not conditionally compiled here"]
 async fn rejected_room_create_in_fetch_event() {
 	let _guard = init_subscriber();
@@ -1055,4 +1038,134 @@ async fn rejected_room_create_in_fetch_event() {
 	)
 	.await
 	.unwrap_err();
+}
+
+// `m.room.member` knock predicate. v7-v9: only `knock` join_rule accepts.
+// v10+: `knock` or `knock_restricted` accepts.
+
+fn member_content_knock() -> Box<serde_json::value::RawValue> {
+	to_raw_json_value(&RoomMemberEventContent::new(MembershipState::Knock)).unwrap()
+}
+
+fn knock_test_events(
+	join_rule: JoinRule,
+) -> std::collections::HashMap<ruma::OwnedEventId, PduEvent> {
+	let mut init_events = INITIAL_EVENTS();
+
+	*init_events.get_mut(&event_id("IJR")).unwrap() = to_pdu_event(
+		"IJR",
+		alice(),
+		TimelineEventType::RoomJoinRules,
+		Some(""),
+		to_raw_json_value(&RoomJoinRulesEventContent::new(join_rule)).unwrap(),
+		&["CREATE", "IMA", "IPOWER"],
+		&["IPOWER"],
+	);
+
+	init_events.insert(
+		event_id("ZARA_LEAVE"),
+		to_pdu_event(
+			"ZARA_LEAVE",
+			zara(),
+			TimelineEventType::RoomMember,
+			Some(zara().as_str()),
+			to_raw_json_value(&RoomMemberEventContent::new(MembershipState::Leave)).unwrap(),
+			&["CREATE", "IJR", "IPOWER"],
+			&["IJR"],
+		),
+	);
+
+	init_events
+}
+
+fn zara_knock_event() -> PduEvent {
+	to_pdu_event(
+		"ZARA_KNOCK",
+		zara(),
+		TimelineEventType::RoomMember,
+		Some(zara().as_str()),
+		member_content_knock(),
+		&["CREATE", "IJR", "IPOWER"],
+		&["ZARA_LEAVE"],
+	)
+}
+
+#[tokio::test]
+async fn knock_with_public_join_rule_rejected_v7() {
+	let _guard = init_subscriber();
+
+	let init_events = knock_test_events(JoinRule::Public);
+	let auth_events = TestStateMap::new(&init_events);
+	let fetch_state = auth_events.fetch_state_fn();
+
+	check_state_dependent_auth_rules(&RoomVersionRules::V7, &zara_knock_event(), &fetch_state)
+		.await
+		.unwrap_err();
+}
+
+#[tokio::test]
+async fn knock_with_invite_join_rule_rejected_v8() {
+	let _guard = init_subscriber();
+
+	let init_events = knock_test_events(JoinRule::Invite);
+	let auth_events = TestStateMap::new(&init_events);
+	let fetch_state = auth_events.fetch_state_fn();
+
+	check_state_dependent_auth_rules(&RoomVersionRules::V8, &zara_knock_event(), &fetch_state)
+		.await
+		.unwrap_err();
+}
+
+#[tokio::test]
+async fn knock_with_knock_join_rule_accepted_v7() {
+	let _guard = init_subscriber();
+
+	let init_events = knock_test_events(JoinRule::Knock);
+	let auth_events = TestStateMap::new(&init_events);
+	let fetch_state = auth_events.fetch_state_fn();
+
+	check_state_dependent_auth_rules(&RoomVersionRules::V7, &zara_knock_event(), &fetch_state)
+		.await
+		.unwrap();
+}
+
+#[tokio::test]
+async fn knock_with_public_join_rule_rejected_v10() {
+	let _guard = init_subscriber();
+
+	let init_events = knock_test_events(JoinRule::Public);
+	let auth_events = TestStateMap::new(&init_events);
+	let fetch_state = auth_events.fetch_state_fn();
+
+	check_state_dependent_auth_rules(&RoomVersionRules::V10, &zara_knock_event(), &fetch_state)
+		.await
+		.unwrap_err();
+}
+
+#[tokio::test]
+async fn knock_with_knock_restricted_join_rule_accepted_v10() {
+	let _guard = init_subscriber();
+
+	let init_events = knock_test_events(JoinRule::KnockRestricted(Restricted::new(vec![])));
+	let auth_events = TestStateMap::new(&init_events);
+	let fetch_state = auth_events.fetch_state_fn();
+
+	check_state_dependent_auth_rules(&RoomVersionRules::V10, &zara_knock_event(), &fetch_state)
+		.await
+		.unwrap();
+}
+
+#[tokio::test]
+async fn knock_with_knock_restricted_join_rule_rejected_v8() {
+	let _guard = init_subscriber();
+
+	// knock_restricted does not exist before v10; in v8 the only accepted
+	// value is `knock`.
+	let init_events = knock_test_events(JoinRule::KnockRestricted(Restricted::new(vec![])));
+	let auth_events = TestStateMap::new(&init_events);
+	let fetch_state = auth_events.fetch_state_fn();
+
+	check_state_dependent_auth_rules(&RoomVersionRules::V8, &zara_knock_event(), &fetch_state)
+		.await
+		.unwrap_err();
 }

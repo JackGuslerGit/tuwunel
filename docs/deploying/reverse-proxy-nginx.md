@@ -25,13 +25,14 @@ Create a new configuration file at `/etc/nginx/sites-available/tuwunel` (or `/et
 
 ```nginx
 upstream tuwunel {
-  127.0.0.1:8008; # IP and port where tuwunel is listening
+  server 127.0.0.1:8008; # IP and port where tuwunel is listening
 }
 
 # Client-Server API over HTTPS (port 443)
 server {
-  listen 443 ssl http2;
-  listen [::]:443 ssl http2;
+  listen 443 ssl;
+  listen [::]:443 ssl;
+  http2 on;
   server_name matrix.example.com;
 
   # Nginx standard body size is 1MB, which is quite small for media uploads
@@ -57,8 +58,9 @@ server {
 # Only needed if you want to federate with other homeservers
 # Don't forget to open port 8448 in your firewall!
 server {
-  listen 8448 ssl http2;
-  listen [::]:8448 ssl http2;
+  listen 8448 ssl;
+  listen [::]:8448 ssl;
+  http2 on;
   server_name matrix.example.com;
 
   # Same body size increase for larger files
@@ -82,6 +84,9 @@ server {
 
 - **Replace `matrix.example.com`** with your actual server name
 - **`client_max_body_size`**: Must match or exceed `max_request_size` in your `tuwunel.toml`
+- **`ip_source`**: If Nginx is the only way clients can reach Tuwunel, set
+  `ip_source = "rightmost_x_forwarded_for"` so Tuwunel uses the trusted
+  `X-Forwarded-For` value
 - **Do NOT use `$request_uri`** in `proxy_pass` - while some guides suggest this, it's not necessary for Tuwunel and can cause issues
 - **IPv6**: The `listen [::]:443` and `listen [::]:8448` lines enable IPv6 support. Remove them if you don't need IPv6
 

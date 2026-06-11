@@ -64,7 +64,7 @@ impl crate::Service for Service {
 
 	async fn memory_usage(&self, out: &mut (dyn Write + Send)) -> Result {
 		let mutex = self.mutex.len();
-		writeln!(out, "state_mutex: {mutex}")?;
+		writeln!(out, "- state_mutex: {mutex}")?;
 
 		Ok(())
 	}
@@ -131,7 +131,7 @@ pub async fn force_state(
 					.state_cache
 					.update_membership(
 						room_id,
-						user_id,
+						&user_id,
 						membership_event,
 						&pdu.sender,
 						None,
@@ -142,12 +142,7 @@ pub async fn force_state(
 					.await
 			},
 			| TimelineEventType::SpaceChild => {
-				self.services
-					.spaces
-					.roomid_spacehierarchy_cache
-					.lock()
-					.await
-					.remove(&pdu.room_id);
+				self.services.spaces.cache_evict(pdu.room_id());
 
 				Ok(())
 			},
@@ -400,7 +395,8 @@ where
 			.collect()
 			.await;
 
-	self.services
+	let (state_keys, event_ids): (Vec<_>, Vec<_>) = self
+		.services
 		.state_accessor
 		.state_full_shortids(shortstatehash)
 		.ready_filter_map(Result::ok)
@@ -410,13 +406,12 @@ where
 				.map(move |(ty, sk)| ((ty, sk), shorteventid))
 		})
 		.unzip()
-		.map(|(state_keys, event_ids): (Vec<_>, Vec<_>)| {
-			self.services
-				.short
-				.multi_get_eventid_from_short(event_ids.into_iter().stream())
-				.zip(state_keys.into_iter().stream())
-		})
-		.flatten_stream()
+		.await;
+
+	self.services
+		.short
+		.multi_get_eventid_from_short(event_ids.into_iter().stream())
+		.zip(state_keys.into_iter().stream())
 		.ready_filter_map(|(event_id, (ty, sk))| Some(((ty, sk), event_id.ok()?)))
 		.broad_filter_map(async |((ty, sk), event_id): ((&_, &_), OwnedEventId)| {
 			let pdu = self.services.timeline.get_pdu(&event_id).await;

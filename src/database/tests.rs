@@ -3,14 +3,16 @@
 
 use std::fmt::Debug;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tuwunel_core::{
 	arrayvec::ArrayVec,
 	ruma::{EventId, RoomId, UserId, serde::Raw},
 };
 
 use crate::{
-	Cbor, Ignore, Interfix, de, ser,
+	Cbor, Ignore, Interfix,
+	de::from_slice,
+	ser,
 	ser::{Json, serialize_to_vec},
 };
 
@@ -215,7 +217,7 @@ fn ser_cbor() {
 	};
 
 	let serialized = serialize_to_vec(Cbor(&filter)).expect("failed to serialize cbor");
-	let deserialized: FilterDefinition = de::from_slice::<Cbor<_>>(&serialized)
+	let deserialized: FilterDefinition = from_slice::<Cbor<_>>(&serialized)
 		.expect("failed to deserialize cbor")
 		.0;
 
@@ -244,12 +246,70 @@ fn ser_cbor_ruma_raw() {
 	};
 
 	let serialized = serialize_to_vec(Cbor(&foo)).expect("failed to serialize cbor");
-	let deserialized: Foo = de::from_slice::<Cbor<_>>(&serialized)
+	let deserialized: Foo = from_slice::<Cbor<_>>(&serialized)
 		.expect("failed to deserialize cbor")
 		.0;
 
 	assert_eq!(foo.a, deserialized.a);
 	assert_eq!(foo.a.get(), deserialized.b.get());
+}
+
+/// `Raw<T>` does NOT round-trip through `Cbor`: serialization succeeds but
+/// the value is encoded as a CBOR newtype struct that the JSON-flavored
+/// `RawValue` deserializer cannot consume. Use `Json(...)` (see
+/// `ser_json_raw_field_roundtrip` below) when a value contains a `Raw<T>`
+/// field.
+#[test]
+#[should_panic(expected = "expected any valid JSON value")]
+fn ser_cbor_raw_field_roundtrip() {
+	#[derive(Debug, Serialize, Deserialize)]
+	struct Entry {
+		key: Raw<serde_json::Value>,
+		used: bool,
+	}
+
+	let entry = Entry {
+		key: Raw::from_json_string(r#"{"hello":"world","n":42}"#.to_owned())
+			.expect("construct Raw"),
+		used: false,
+	};
+
+	let serialized = serialize_to_vec(Cbor(&entry)).expect("serialize cbor");
+
+	let _: Entry = from_slice::<Cbor<_>>(&serialized)
+		.expect("deserialize cbor")
+		.0;
+}
+
+/// Round-trip the same `Raw<T>`-bearing struct through `Json`. This is the
+/// supported path: `RawValue`'s special-case in `serde_json` preserves the
+/// inner JSON bytes verbatim across both directions.
+#[test]
+fn ser_json_raw_field_roundtrip() {
+	#[derive(Debug, Serialize, Deserialize)]
+	struct Entry {
+		key: Raw<serde_json::Value>,
+		used: bool,
+	}
+
+	let original_json = r#"{"hello":"world","n":42}"#;
+	let entry = Entry {
+		key: Raw::from_json_string(original_json.to_owned()).expect("construct Raw"),
+		used: false,
+	};
+
+	let serialized = serialize_to_vec(Json(&entry)).expect("serialize json");
+
+	let deserialized: Entry = from_slice::<Json<_>>(&serialized)
+		.expect("deserialize json")
+		.0;
+
+	assert_eq!(entry.used, deserialized.used);
+	assert_eq!(
+		entry.key.json().get(),
+		deserialized.key.json().get(),
+		"Raw<T> JSON did not round-trip through Json"
+	);
 }
 
 #[test]
@@ -258,7 +318,7 @@ fn de_tuple() {
 	let room_id: &RoomId = "!room:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com\xFF!room:example.com";
-	let (a, b): (&UserId, &RoomId) = de::from_slice(raw).expect("failed to deserialize");
+	let (a, b): (&UserId, &RoomId) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 	assert_eq!(b, room_id, "deserialized room_id does not match");
@@ -271,7 +331,7 @@ fn de_tuple_invalid() {
 	let room_id: &RoomId = "!room:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com\xFF@user:example.com";
-	let (a, b): (&UserId, &RoomId) = de::from_slice(raw).expect("failed to deserialize");
+	let (a, b): (&UserId, &RoomId) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 	assert_eq!(b, room_id, "deserialized room_id does not match");
@@ -283,7 +343,7 @@ fn de_tuple_incomplete() {
 	let user_id: &UserId = "@user:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com";
-	let (a, _): (&UserId, &RoomId) = de::from_slice(raw).expect("failed to deserialize");
+	let (a, _): (&UserId, &RoomId) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 }
@@ -293,7 +353,7 @@ fn de_tuple_incomplete_default() {
 	let user_id: &UserId = "@user:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com";
-	let (a, b): (&UserId, &str) = de::from_slice(raw).expect("failed to deserialize");
+	let (a, b): (&UserId, &str) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 	assert_eq!(b, "", "deserialized defaulted str does not match");
@@ -305,7 +365,7 @@ fn de_tuple_incomplete_nodefault() {
 	let user_id: &UserId = "@user:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com";
-	let (a, _): (&UserId, u64) = de::from_slice(raw).expect("failed to deserialize");
+	let (a, _): (&UserId, u64) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 }
@@ -315,10 +375,124 @@ fn de_tuple_incomplete_option() {
 	let user_id: &UserId = "@user:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com";
-	let (a, b): (&UserId, Option<&str>) = de::from_slice(raw).expect("failed to deserialize");
+	let (a, b): (&UserId, Option<&str>) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 	assert_eq!(b, None, "deserialized defaulted Option does not match");
+}
+
+#[test]
+fn de_tuple_incomplete_str() {
+	let user_id: &UserId = "@user:example.com".try_into().unwrap();
+
+	let raw: &[u8] = b"@user:example.com";
+	let (a, b): (&UserId, &str) = from_slice(raw).expect("failed to deserialize");
+
+	assert_eq!(a, user_id, "deserialized user_id does not match");
+	assert_eq!(b, "", "trailing &str defaulted from missing input");
+}
+
+#[test]
+fn de_tuple_incomplete_bytes() {
+	let user_id: &UserId = "@user:example.com".try_into().unwrap();
+
+	let raw: &[u8] = b"@user:example.com";
+	let (a, b): (&UserId, &[u8]) = from_slice(raw).expect("failed to deserialize");
+
+	assert_eq!(a, user_id, "deserialized user_id does not match");
+	assert!(b.is_empty(), "trailing &[u8] defaulted from missing input");
+}
+
+#[test]
+fn de_tuple_incomplete_str_after_sep() {
+	let user_id: &UserId = "@user:example.com".try_into().unwrap();
+
+	let raw: &[u8] = b"@user:example.com\xFF";
+	let (a, b): (&UserId, &str) = from_slice(raw).expect("failed to deserialize");
+
+	assert_eq!(a, user_id, "deserialized user_id does not match");
+	assert_eq!(b, "", "trailing &str defaulted from empty record after sep");
+}
+
+#[test]
+fn serde_tuple_additive_evolution() {
+	let room_id: &RoomId = "!room:example.com".try_into().unwrap();
+	let user_id: &UserId = "@user:example.com".try_into().unwrap();
+	let count: u64 = 42;
+
+	let old_bytes =
+		serialize_to_vec(&(room_id, count, user_id)).expect("failed to serialize old key");
+
+	let (r, c, u, tail): (&RoomId, u64, &UserId, &str) =
+		from_slice(&old_bytes).expect("failed to deserialize old key as new type");
+
+	assert_eq!(r, room_id);
+	assert_eq!(c, count);
+	assert_eq!(u, user_id);
+	assert_eq!(tail, "", "tail must default to empty for old rows");
+
+	let new_bytes =
+		serialize_to_vec(&(room_id, count, user_id, "")).expect("failed to serialize new key");
+
+	assert_eq!(&new_bytes[..old_bytes.len()], &*old_bytes);
+	assert_eq!(new_bytes.len(), old_bytes.len() + 1);
+	assert_eq!(*new_bytes.last().unwrap(), 0xFF);
+
+	let (r, c, u, tail): (&RoomId, u64, &UserId, &str) =
+		from_slice(&new_bytes).expect("failed to deserialize new key");
+
+	assert_eq!(r, room_id);
+	assert_eq!(c, count);
+	assert_eq!(u, user_id);
+	assert_eq!(tail, "");
+}
+
+#[test]
+fn serde_tuple_additive_evolution_option() {
+	let room_id: &RoomId = "!room:example.com".try_into().unwrap();
+	let count: u64 = 42;
+
+	let old_bytes = serialize_to_vec(&(room_id, count)).expect("failed to serialize old key");
+
+	let (r, c, tail): (&RoomId, u64, Option<&UserId>) =
+		from_slice(&old_bytes).expect("failed to deserialize");
+
+	assert_eq!(r, room_id);
+	assert_eq!(c, count);
+	assert_eq!(tail, None);
+}
+
+#[test]
+fn ser_de_eventid_backoff_record() {
+	let event_id: &EventId = "$evt:example.com".try_into().unwrap();
+	let ctx: u8 = 2;
+	let bucket: u32 = 0x2A2B_2C2D;
+
+	// The production read path deserializes the value; it must round-trip.
+	let val = serialize_to_vec(&(1_u64, 1_717_171_717_u64)).expect("failed to serialize value");
+	let (class, secs): (u64, u64) = from_slice(&val).expect("failed to deserialize value");
+	assert_eq!(class, 1, "class byte does not round-trip");
+	assert_eq!(secs, 1_717_171_717, "timestamp does not round-trip");
+
+	// The bucket key carries the (ctx, event_id) prefix the scan and delete use.
+	let key = serialize_to_vec(&(ctx, event_id, bucket)).expect("failed to serialize key");
+	let prefix =
+		serialize_to_vec(&(ctx, event_id, Interfix)).expect("failed to serialize prefix");
+	assert!(key.starts_with(&prefix), "bucket key does not carry its prefix");
+
+	// The trailing separator bounds the scan: a longer id sharing a byte-prefix
+	// must not match.
+	let longer: &EventId = "$evt:example.computer".try_into().unwrap();
+	let longer_key =
+		serialize_to_vec(&(ctx, longer, bucket)).expect("failed to serialize longer");
+	assert!(!longer_key.starts_with(&prefix), "prefix bleeds into a longer id");
+}
+
+#[test]
+#[should_panic(expected = "failed to deserialize")]
+fn de_tuple_incomplete_non_tolerant_tail() {
+	let raw: &[u8] = b"@user:example.com";
+	let _: (&UserId, u64) = from_slice(raw).expect("failed to deserialize");
 }
 
 #[test]
@@ -327,7 +501,7 @@ fn de_tuple_incomplete_with_sep() {
 	let user_id: &UserId = "@user:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com\xFF";
-	let (a, _): (&UserId, &RoomId) = de::from_slice(raw).expect("failed to deserialize");
+	let (a, _): (&UserId, &RoomId) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 }
@@ -342,7 +516,7 @@ fn de_tuple_unfinished() {
 	let room_id: &RoomId = "!room:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com\xFF!room:example.com\xFF@user:example.com";
-	let (a, b): (&UserId, &RoomId) = de::from_slice(raw).expect("failed to deserialize");
+	let (a, b): (&UserId, &RoomId) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 	assert_eq!(b, room_id, "deserialized room_id does not match");
@@ -354,8 +528,7 @@ fn de_tuple_ignore() {
 	let room_id: &RoomId = "!room:example.com".try_into().unwrap();
 
 	let raw: &[u8] = b"@user:example.com\xFF@user2:example.net\xFF!room:example.com";
-	let (a, _, c): (&UserId, Ignore, &RoomId) =
-		de::from_slice(raw).expect("failed to deserialize");
+	let (a, _, c): (&UserId, Ignore, &RoomId) = from_slice(raw).expect("failed to deserialize");
 
 	assert_eq!(a, user_id, "deserialized user_id does not match");
 	assert_eq!(c, room_id, "deserialized room_id does not match");
@@ -366,7 +539,7 @@ fn de_json_array() {
 	let a = &["foo", "bar", "baz"];
 	let s = serde_json::to_vec(a).expect("failed to serialize to JSON array");
 
-	let b: Raw<Vec<Raw<String>>> = de::from_slice(&s).expect("failed to deserialize");
+	let b: Raw<Vec<Raw<String>>> = from_slice(&s).expect("failed to deserialize");
 
 	let d: Vec<String> =
 		serde_json::from_str(b.json().get()).expect("failed to deserialize JSON");
@@ -381,7 +554,7 @@ fn de_json_raw_array() {
 	let a = &["foo", "bar", "baz"];
 	let s = serde_json::to_vec(a).expect("failed to serialize to JSON array");
 
-	let b: Raw<Vec<Raw<String>>> = de::from_slice(&s).expect("failed to deserialize");
+	let b: Raw<Vec<Raw<String>>> = from_slice(&s).expect("failed to deserialize");
 
 	let c: Vec<Raw<String>> =
 		serde_json::from_str(b.json().get()).expect("failed to deserialize JSON");
@@ -493,7 +666,7 @@ fn de_array_integer() {
 	v.extend_from_slice(&a.to_be_bytes());
 	v.extend_from_slice(&b.to_be_bytes());
 
-	let arv: ArrayVec<u64, 2> = de::from_slice::<ArrayVec<u64, 2>>(v.as_slice())
+	let arv: ArrayVec<u64, 2> = from_slice::<ArrayVec<u64, 2>>(v.as_slice())
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to arrayvec")
 		.expect("failed to deserialize into");
@@ -501,7 +674,7 @@ fn de_array_integer() {
 	assert_eq!(arv[0], a, "deserialized arv [0] does not match");
 	assert_eq!(arv[1], b, "deserialized arv [1] does not match");
 
-	let arr: [u64; 2] = de::from_slice::<[u64; 2]>(v.as_slice())
+	let arr: [u64; 2] = from_slice::<[u64; 2]>(v.as_slice())
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to array")
 		.expect("failed to deserialize into");
@@ -509,7 +682,7 @@ fn de_array_integer() {
 	assert_eq!(arr[0], a, "deserialized arr [0] does not match");
 	assert_eq!(arr[1], b, "deserialized arr [1] does not match");
 
-	let vec: Vec<u64> = de::from_slice(v.as_slice()).expect("failed to deserialize to vec");
+	let vec: Vec<u64> = from_slice(v.as_slice()).expect("failed to deserialize to vec");
 
 	assert_eq!(vec[0], a, "deserialized vec [0] does not match");
 	assert_eq!(vec[1], b, "deserialized vec [1] does not match");
@@ -521,7 +694,7 @@ fn de_array_string() {
 	let b = "bar";
 	let v = b"foo\xFFbar";
 
-	let arv: ArrayVec<&str, 2> = de::from_slice::<ArrayVec<&str, 2>>(v)
+	let arv: ArrayVec<&str, 2> = from_slice::<ArrayVec<&str, 2>>(v)
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to arrayvec")
 		.expect("failed to deserialize into");
@@ -529,7 +702,7 @@ fn de_array_string() {
 	assert_eq!(arv[1], b, "deserialized arv [1] does not match");
 	assert_eq!(arv.len(), 2);
 
-	let arv: ArrayVec<String, 2> = de::from_slice::<ArrayVec<String, 2>>(v)
+	let arv: ArrayVec<String, 2> = from_slice::<ArrayVec<String, 2>>(v)
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to arrayvec")
 		.expect("failed to deserialize into");
@@ -537,26 +710,26 @@ fn de_array_string() {
 	assert_eq!(arv[1], b, "deserialized arv [1] does not match");
 	assert_eq!(arv.len(), 2);
 
-	let arr: [&str; 2] = de::from_slice::<[&str; 2]>(v)
+	let arr: [&str; 2] = from_slice::<[&str; 2]>(v)
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to array")
 		.expect("failed to deserialize into");
 	assert_eq!(arr[0], a, "deserialized arr [0] does not match");
 	assert_eq!(arr[1], b, "deserialized arr [1] does not match");
 
-	let arr: [String; 2] = de::from_slice::<[String; 2]>(v)
+	let arr: [String; 2] = from_slice::<[String; 2]>(v)
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to array")
 		.expect("failed to deserialize into");
 	assert_eq!(arr[0], a, "deserialized arr [0] does not match");
 	assert_eq!(arr[1], b, "deserialized arr [1] does not match");
 
-	let vec: Vec<&str> = de::from_slice(v).expect("failed to deserialize to vec");
+	let vec: Vec<&str> = from_slice(v).expect("failed to deserialize to vec");
 	assert_eq!(vec[0], a, "deserialized vec [0] does not match");
 	assert_eq!(vec[1], b, "deserialized vec [1] does not match");
 	assert_eq!(vec.len(), 2);
 
-	let vec: Vec<String> = de::from_slice(v).expect("failed to deserialize to vec");
+	let vec: Vec<String> = from_slice(v).expect("failed to deserialize to vec");
 	assert_eq!(vec[0], a, "deserialized vec [0] does not match");
 	assert_eq!(vec[1], b, "deserialized vec [1] does not match");
 	assert_eq!(vec.len(), 2);
@@ -567,37 +740,37 @@ fn de_array_one_string() {
 	let a = "foo";
 	let v = b"foo";
 
-	let arv: ArrayVec<&str, 1> = de::from_slice::<ArrayVec<&str, 1>>(v)
+	let arv: ArrayVec<&str, 1> = from_slice::<ArrayVec<&str, 1>>(v)
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to arrayvec")
 		.expect("failed to deserialize into");
 	assert_eq!(arv[0], a, "deserialized arv [0] does not match");
 	assert_eq!(arv.len(), 1);
 
-	let arv: ArrayVec<String, 1> = de::from_slice::<ArrayVec<String, 1>>(v)
+	let arv: ArrayVec<String, 1> = from_slice::<ArrayVec<String, 1>>(v)
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to arrayvec")
 		.expect("failed to deserialize into");
 	assert_eq!(arv[0], a, "deserialized arv [0] does not match");
 	assert_eq!(arv.len(), 1);
 
-	let arr: [&str; 1] = de::from_slice::<[&str; 1]>(v)
+	let arr: [&str; 1] = from_slice::<[&str; 1]>(v)
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to array")
 		.expect("failed to deserialize into");
 	assert_eq!(arr[0], a, "deserialized arr [0] does not match");
 
-	let arr: [String; 1] = de::from_slice::<[String; 1]>(v)
+	let arr: [String; 1] = from_slice::<[String; 1]>(v)
 		.map(TryInto::try_into)
 		.expect("failed to deserialize to array")
 		.expect("failed to deserialize into");
 	assert_eq!(arr[0], a, "deserialized arr [0] does not match");
 
-	let vec: Vec<&str> = de::from_slice(v).expect("failed to deserialize to vec");
+	let vec: Vec<&str> = from_slice(v).expect("failed to deserialize to vec");
 	assert_eq!(vec[0], a, "deserialized vec [0] does not match");
 	assert_eq!(vec.len(), 1);
 
-	let vec: Vec<String> = de::from_slice(v).expect("failed to deserialize to vec");
+	let vec: Vec<String> = from_slice(v).expect("failed to deserialize to vec");
 	assert_eq!(vec[0], a, "deserialized vec [0] does not match");
 	assert_eq!(vec.len(), 1);
 }
@@ -627,11 +800,11 @@ fn de_complex() {
 	assert_eq!(&s, &v, "serialization does not match");
 
 	let key = (user_id, [a, b].into(), room_id);
-	let arr: Key<'_> = de::from_slice(&v).expect("failed to deserialize");
+	let arr: Key<'_> = from_slice(&v).expect("failed to deserialize");
 
 	assert_eq!(arr, key, "deserialization does not match");
 
-	let arr: Key<'_> = de::from_slice(&s).expect("failed to deserialize");
+	let arr: Key<'_> = from_slice(&s).expect("failed to deserialize");
 
 	assert_eq!(arr, key, "deserialization of serialization does not match");
 }
@@ -650,8 +823,7 @@ fn serde_tuple_option_value_some() {
 	let bbs = serialize_to_vec(&bb).expect("failed to serialize tuple");
 	assert_eq!(aa, bbs);
 
-	let cc: (&RoomId, Option<&UserId>) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+	let cc: (&RoomId, Option<&UserId>) = from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(bb.1, cc.1);
 	assert_eq!(cc.0, bb.0);
@@ -669,8 +841,7 @@ fn serde_tuple_option_value_none() {
 	let bbs = serialize_to_vec(&bb).expect("failed to serialize tuple");
 	assert_eq!(aa, bbs);
 
-	let cc: (&RoomId, Option<&UserId>) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+	let cc: (&RoomId, Option<&UserId>) = from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(None, cc.1);
 	assert_eq!(cc.0, bb.0);
@@ -688,8 +859,7 @@ fn serde_tuple_option_none_value() {
 	let bbs = serialize_to_vec(&bb).expect("failed to serialize tuple");
 	assert_eq!(aa, bbs);
 
-	let cc: (Option<&RoomId>, &UserId) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+	let cc: (Option<&RoomId>, &UserId) = from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(None, cc.0);
 	assert_eq!(cc.1, bb.1);
@@ -709,8 +879,7 @@ fn serde_tuple_option_some_value() {
 	let bbs = serialize_to_vec(&bb).expect("failed to serialize tuple");
 	assert_eq!(aa, bbs);
 
-	let cc: (Option<&RoomId>, &UserId) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+	let cc: (Option<&RoomId>, &UserId) = from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(bb.0, cc.0);
 	assert_eq!(cc.1, bb.1);
@@ -731,7 +900,7 @@ fn serde_tuple_option_value_incomplete() {
 	assert_eq!(aa, bbs);
 
 	let cc: (&RoomId, &UserId, Option<u64>) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+		from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(bb.0, cc.0);
 	assert_eq!(bb.1, cc.1);
@@ -753,7 +922,7 @@ fn serde_tuple_option_some_some() {
 	assert_eq!(aa, bbs);
 
 	let cc: (Option<&RoomId>, Option<&UserId>) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+		from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(cc.0, bb.0);
 	assert_eq!(bb.1, cc.1);
@@ -768,7 +937,7 @@ fn serde_tuple_option_none_none() {
 	assert_eq!(aa, bbs);
 
 	let cc: (Option<&RoomId>, Option<&UserId>) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+		from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(cc.0, bb.0);
 	assert_eq!(None, cc.1);
@@ -792,7 +961,7 @@ fn serde_tuple_option_some_none_some() {
 	assert_eq!(aa, bbs);
 
 	let cc: (Option<&RoomId>, Option<&EventId>, Option<&UserId>) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+		from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(bb.0, cc.0);
 	assert_eq!(None, cc.1);
@@ -809,7 +978,7 @@ fn serde_tuple_option_none_none_none() {
 	assert_eq!(aa, bbs);
 
 	let cc: (Option<&RoomId>, Option<&EventId>, Option<&UserId>) =
-		de::from_slice(&bbs).expect("failed to deserialize tuple");
+		from_slice(&bbs).expect("failed to deserialize tuple");
 
 	assert_eq!(None, cc.0);
 	assert_eq!(bb, cc);
@@ -829,8 +998,7 @@ fn serde_tuple_integer_string() {
 
 	assert_eq!(a, s);
 
-	let c: (u64, &UserId) =
-		de::from_slice(&s).expect("failed to deserialize (integer,string) tuple");
+	let c: (u64, &UserId) = from_slice(&s).expect("failed to deserialize (integer,string) tuple");
 
 	assert_eq!(c, b, "deserialized (integer,string) tuple did not match");
 }
@@ -854,7 +1022,7 @@ fn serde_tuple_string_integer_string() {
 	assert_eq!(a, s);
 
 	let c: (&RoomId, u64, &UserId) =
-		de::from_slice(&s).expect("failed to deserialize (integer,string) tuple");
+		from_slice(&s).expect("failed to deserialize (integer,string) tuple");
 
 	assert_eq!(c, b, "deserialized (string,integer,string) tuple did not match");
 }

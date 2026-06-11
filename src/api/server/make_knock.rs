@@ -3,7 +3,10 @@ use axum::extract::State;
 use futures::TryFutureExt;
 use ruma::{
 	RoomVersionId,
-	api::{client::error::ErrorKind, federation::membership::prepare_knock_event},
+	api::{
+		error::{ErrorKind, IncompatibleRoomVersionErrorData},
+		federation::membership::prepare_knock_event,
+	},
 	events::room::member::{MembershipState, RoomMemberEventContent},
 };
 use tuwunel_core::{Err, Error, Result, at, debug_warn, matrix::pdu::PduBuilder};
@@ -34,8 +37,7 @@ pub(crate) async fn create_knock_event_template_route(
 	if let Some(server) = body.room_id.server_name()
 		&& services
 			.config
-			.forbidden_remote_server_names
-			.is_match(server.host())
+			.is_forbidden_remote_server_name(server)
 	{
 		return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 	}
@@ -47,14 +49,18 @@ pub(crate) async fn create_knock_event_template_route(
 
 	if matches!(room_version, V1 | V2 | V3 | V4 | V5 | V6) {
 		return Err(Error::BadRequest(
-			ErrorKind::IncompatibleRoomVersion { room_version },
+			ErrorKind::IncompatibleRoomVersion(IncompatibleRoomVersionErrorData::new(
+				room_version.clone(),
+			)),
 			"Room version does not support knocking.",
 		));
 	}
 
 	if !body.ver.contains(&room_version) {
 		return Err(Error::BadRequest(
-			ErrorKind::IncompatibleRoomVersion { room_version },
+			ErrorKind::IncompatibleRoomVersion(IncompatibleRoomVersionErrorData::new(
+				room_version.clone(),
+			)),
 			"Your homeserver does not support the features required to knock on this room.",
 		));
 	}

@@ -3,15 +3,16 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
+use futures::{TryStreamExt, pin_mut};
 use ruma::{
 	CanonicalJsonValue, DeviceId, OwnedDeviceId, OwnedUserId, UserId,
-	api::client::{
+	api::{
+		client::uiaa::{AuthData, AuthType, Password, UiaaInfo, UserIdentifier},
 		error::{ErrorKind, StandardErrorBody},
-		uiaa::{AuthData, AuthType, Password, UiaaInfo, UserIdentifier},
 	},
 };
 use tuwunel_core::{
-	Err, Result, debug_warn, err, error, extract, implement,
+	Err, Result, err, error, extract, implement,
 	utils::{self, BoolExt, hash, string::EMPTY},
 };
 use tuwunel_database::{Deserialized, Json, Map};
@@ -91,7 +92,7 @@ pub async fn try_auth(
 	match auth {
 		// Find out what the user completed
 		| AuthData::Password(Password { identifier, password, user, .. }) => {
-			let username = extract!(identifier, x in Some(UserIdentifier::UserIdOrLocalpart(x)))
+			let username = extract!(identifier, x in Some(UserIdentifier::Matrix(ruma::api::client::uiaa::MatrixUserIdentifier { user: x, .. })))
 				.or_else(|| cfg!(feature = "element_hacks").and(user.as_ref()))
 				.ok_or(err!(Request(Unrecognized("Identifier type not recognized."))))?;
 
@@ -180,8 +181,31 @@ pub async fn try_auth(
 				return Ok((false, uiaainfo));
 			}
 		},
-		| AuthData::FallbackAcknowledgement(session) => {
-			debug_warn!("FallbackAcknowledgement: {session:?}");
+		| AuthData::FallbackAcknowledgement(_session) => {
+			// A fallback acknowledgement is a session re-poll. The fallback
+			// web handler (e.g. the SSO callback) is what records completion.
+		},
+		| AuthData::OAuth(_) => {
+			// MSC4312: OAuth cross-signing reset uses SSO re-authentication.
+			// If a bypass was granted via SSO re-auth, mark OAuth as completed.
+			if !uiaainfo.completed.contains(&AuthType::OAuth) {
+				if self
+					.services
+					.users
+					.can_replace_cross_signing_keys(user_id)
+					.await
+				{
+					uiaainfo.completed.push(AuthType::OAuth);
+				} else {
+					uiaainfo.auth_error = Some(StandardErrorBody {
+						kind: ErrorKind::forbidden(),
+						message: "OAuth cross-signing reset not approved for this session."
+							.to_owned(),
+					});
+
+					return Ok((false, uiaainfo));
+				}
+			}
 		},
 		| AuthData::Dummy(_) => {
 			uiaainfo.completed.push(AuthType::Dummy);
@@ -252,7 +276,7 @@ pub fn get_uiaa_request(
 }
 
 #[implement(Service)]
-fn update_uiaa_session(
+pub fn update_uiaa_session(
 	&self,
 	user_id: &UserId,
 	device_id: &DeviceId,
@@ -285,4 +309,31 @@ async fn get_uiaa_session(
 		.await
 		.deserialized()
 		.map_err(|_| err!(Request(Forbidden("UIAA session does not exist."))))
+}
+
+#[implement(Service)]
+pub async fn get_uiaa_session_by_session_id(
+	&self,
+	session_id: &str,
+) -> Option<(OwnedUserId, OwnedDeviceId, UiaaInfo)> {
+	// Iterate over keys only (fastest way without a secondary index)
+	let stream = self
+		.db
+		.userdevicesessionid_uiaainfo
+		.keys::<(OwnedUserId, OwnedDeviceId, String)>();
+
+	pin_mut!(stream);
+	while let Ok(Some((user_id, device_id, session))) = stream.try_next().await {
+		if session == session_id {
+			// Found the key, now fetch the actual UiaaInfo
+			if let Ok(uiaainfo) = self
+				.get_uiaa_session(&user_id, &device_id, session_id)
+				.await
+			{
+				return Some((user_id, device_id, uiaainfo));
+			}
+		}
+	}
+
+	None
 }

@@ -6,7 +6,7 @@ pub use tuwunel_core::config::IdentityProvider as Provider;
 use tuwunel_core::{Err, Result, debug, debug::INFO_SPAN_LEVEL, err, implement};
 use url::Url;
 
-use crate::SelfServices;
+use crate::{SelfServices, client::read_response_capped};
 
 /// Discovered providers
 #[derive(Default)]
@@ -85,6 +85,26 @@ pub fn get_config(&self, id: &str) -> Result<Provider> {
 	Err!(Request(NotFound("Unrecognized Identity Provider")))
 }
 
+/// Get the ID of the provider considered "default" as selected by the admin or
+/// by fallback.
+#[implement(Providers)]
+pub fn get_default_id(&self) -> Option<String> {
+	self.services
+		.config
+		.identity_provider
+		.values()
+		.find(|idp| idp.default)
+		.or_else(|| {
+			self.services
+				.config
+				.identity_provider
+				.values()
+				.next()
+		})
+		.map(Provider::id)
+		.map(ToOwned::to_owned)
+}
+
 /// Get the discovered provider from the runtime cache. ID may be client_id or
 /// brand if brand is unique among provider configurations.
 #[implement(Providers)]
@@ -127,18 +147,11 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 		_ = provider
 			.issuer_url
 			.replace(match provider.brand.as_str() {
-				| "github" => "https://github.com".try_into()?,
+				| "github" => "https://github.com/login/oauth".try_into()?,
 				| "gitlab" => "https://gitlab.com".try_into()?,
 				| "google" => "https://accounts.google.com".try_into()?,
 				| _ => return Err!(Config("issuer_url", "Required for this provider.")),
 			});
-	}
-
-	if provider.base_path.is_none() {
-		provider.base_path = match provider.brand.as_str() {
-			| "github" => Some("login/oauth/".to_owned()),
-			| _ => None,
-		};
 	}
 
 	let response = self
@@ -229,16 +242,19 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 #[implement(Providers)]
 #[tracing::instrument(level = "debug", ret(level = "trace"), skip(self))]
 pub async fn discover(&self, provider: &Provider) -> Result<JsonValue> {
-	self.services
+	let limit = self.services.config.max_response_size;
+	let response = self
+		.services
 		.client
 		.oauth
 		.get(discovery_url(provider)?)
 		.send()
 		.await?
-		.error_for_status()?
-		.json()
-		.await
-		.map_err(Into::into)
+		.error_for_status()?;
+
+	let body = read_response_capped(response, limit).await?;
+
+	serde_json::from_slice(&body).map_err(Into::into)
 }
 
 /// Compute the location of the `/.well-known/openid-configuration` based on the

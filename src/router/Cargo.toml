@@ -103,7 +103,6 @@ zstd_compression = [
 ]
 
 [dependencies]
-axum-client-ip.workspace = true
 axum-server-dual-protocol.workspace = true
 axum-server-dual-protocol.optional = true
 axum-server.workspace = true
@@ -111,10 +110,11 @@ axum.workspace = true
 bytes.workspace = true
 const-str.workspace = true
 ctor.workspace = true
+dtor.workspace = true
 futures.workspace = true
 http.workspace = true
 http-body-util.workspace = true
-hyper.workspace = true
+ipnet.workspace = true
 log.workspace = true
 ruma.workspace = true
 rustls.workspace = true

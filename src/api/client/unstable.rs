@@ -1,24 +1,22 @@
 use axum::extract::State;
-use axum_client_ip::InsecureClientIp;
 use futures::StreamExt;
 use ruma::{
 	OwnedRoomId,
 	api::{
 		client::{
-			error::ErrorKind,
 			membership::mutual_rooms,
-			profile::{
-				ProfileFieldName, ProfileFieldValue, delete_profile_field, delete_timezone_key,
-				get_profile_field, get_timezone_key, set_profile_field, set_timezone_key,
-			},
+			profile::{delete_profile_field, get_profile_field, set_profile_field},
 		},
 		federation,
 	},
 	presence::PresenceState,
+	profile::{ProfileFieldName, ProfileFieldValue},
 };
-use tuwunel_core::{Err, Error, Result, err};
+use tuwunel_core::{Err, Result, err};
+use tuwunel_service::users::propagation_default;
 
-use crate::Ruma;
+use super::profile::{profile_mxc, profile_str, resolve_propagation};
+use crate::{ClientIp, Ruma};
 
 /// # `GET /_matrix/client/unstable/uk.half-shot.msc2666/user/mutual_rooms`
 ///
@@ -30,7 +28,7 @@ use crate::Ruma;
 #[tracing::instrument(skip_all, fields(%client), name = "mutual_rooms")]
 pub(crate) async fn get_mutual_rooms_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<mutual_rooms::unstable::Request>,
 ) -> Result<mutual_rooms::unstable::Response> {
 	let sender_user = body.sender_user();
@@ -56,67 +54,16 @@ pub(crate) async fn get_mutual_rooms_route(
 	})
 }
 
-/// # `DELETE /_matrix/client/unstable/uk.tcpip.msc4133/profile/{user_id}/us.cloke.msc4175.tz`
+/// # `PUT /_matrix/client/v3/profile/{user_id}/{field}`
 ///
-/// Deletes the `tz` (timezone) of a user, as per MSC4133 and MSC4175.
-///
-/// - Also makes sure other users receive the update using presence EDUs
-pub(crate) async fn delete_timezone_key_route(
-	State(services): State<crate::State>,
-	body: Ruma<delete_timezone_key::unstable::Request>,
-) -> Result<delete_timezone_key::unstable::Response> {
-	let sender_user = body.sender_user();
-
-	if *sender_user != body.user_id && body.appservice_info.is_none() {
-		return Err!(Request(Forbidden("You cannot update the profile of another user")));
-	}
-
-	services.users.set_timezone(&body.user_id, None);
-
-	// Presence update
-	services
-		.presence
-		.maybe_ping_presence(&body.user_id, body.sender_device.as_deref(), &PresenceState::Online)
-		.await?;
-
-	Ok(delete_timezone_key::unstable::Response {})
-}
-
-/// # `PUT /_matrix/client/unstable/uk.tcpip.msc4133/profile/{user_id}/us.cloke.msc4175.tz`
-///
-/// Updates the `tz` (timezone) of a user, as per MSC4133 and MSC4175.
-///
-/// - Also makes sure other users receive the update using presence EDUs
-pub(crate) async fn set_timezone_key_route(
-	State(services): State<crate::State>,
-	body: Ruma<set_timezone_key::unstable::Request>,
-) -> Result<set_timezone_key::unstable::Response> {
-	let sender_user = body.sender_user();
-
-	if *sender_user != body.user_id && body.appservice_info.is_none() {
-		return Err!(Request(Forbidden("You cannot update the profile of another user")));
-	}
-
-	services
-		.users
-		.set_timezone(&body.user_id, body.tz.as_deref());
-
-	// Presence update
-	services
-		.presence
-		.maybe_ping_presence(&body.user_id, body.sender_device.as_deref(), &PresenceState::Online)
-		.await?;
-
-	Ok(set_timezone_key::unstable::Response {})
-}
-
-/// # `PUT /_matrix/client/unstable/uk.tcpip.msc4133/profile/{user_id}/{field}`
-///
-/// Updates the profile key-value field of a user, as per MSC4133.
+/// Updates the profile key-value field of a user. Stabilized as part of
+/// Matrix 1.16 (MSC4133); ruma's history block keeps the unstable
+/// `uk.tcpip.msc4133` path mounted for older clients.
 ///
 /// This also handles the avatar_url and displayname being updated.
 pub(crate) async fn set_profile_field_route(
 	State(services): State<crate::State>,
+	ClientIp(client): ClientIp,
 	body: Ruma<set_profile_field::v3::Request>,
 ) -> Result<set_profile_field::v3::Response> {
 	let sender_user = body.sender_user();
@@ -125,9 +72,27 @@ pub(crate) async fn set_profile_field_route(
 		return Err!(Request(Forbidden("You cannot update the profile of another user")));
 	}
 
+	// MSC3823: displayname/avatar are forbidden during suspension; custom
+	// MSC4133 fields fall through.
+	if matches!(body.value, ProfileFieldValue::DisplayName(_) | ProfileFieldValue::AvatarUrl(_))
+		&& services.users.is_suspended(sender_user).await
+	{
+		return Err!(Request(UserSuspended("Account is suspended.")));
+	}
+
 	if body.value.field_name().as_str().len() > 128 {
 		return Err!(Request(BadJson("Key names cannot be longer than 128 bytes")));
 	}
+
+	let propagation = resolve_propagation(
+		&body.propagate_to,
+		propagation_default(
+			services
+				.server
+				.config
+				.preserve_room_profile_overrides,
+		),
+	);
 
 	match &body.value {
 		| ProfileFieldValue::DisplayName(displayname) => {
@@ -140,7 +105,12 @@ pub(crate) async fn set_profile_field_route(
 
 			services
 				.users
-				.update_displayname(&body.user_id, Some(displayname), &all_joined_rooms)
+				.update_displayname(
+					&body.user_id,
+					Some(displayname),
+					&all_joined_rooms,
+					propagation,
+				)
 				.await;
 		},
 		| ProfileFieldValue::AvatarUrl(avatar_url) => {
@@ -153,7 +123,13 @@ pub(crate) async fn set_profile_field_route(
 
 			services
 				.users
-				.update_avatar_url(&body.user_id, Some(avatar_url), None, &all_joined_rooms)
+				.update_avatar_url(
+					&body.user_id,
+					Some(avatar_url),
+					None,
+					&all_joined_rooms,
+					propagation,
+				)
 				.await;
 		},
 		| _ => {
@@ -168,7 +144,12 @@ pub(crate) async fn set_profile_field_route(
 	// Presence update
 	services
 		.presence
-		.maybe_ping_presence(&body.user_id, body.sender_device.as_deref(), &PresenceState::Online)
+		.maybe_ping_presence(
+			&body.user_id,
+			body.sender_device.as_deref(),
+			Some(client),
+			&PresenceState::Online,
+		)
 		.await?;
 
 	Ok(set_profile_field::v3::Response {})
@@ -181,6 +162,7 @@ pub(crate) async fn set_profile_field_route(
 /// This also handles the avatar_url and displayname being updated.
 pub(crate) async fn delete_profile_field_route(
 	State(services): State<crate::State>,
+	ClientIp(client): ClientIp,
 	body: Ruma<delete_profile_field::v3::Request>,
 ) -> Result<delete_profile_field::v3::Response> {
 	let sender_user = body.sender_user();
@@ -188,6 +170,24 @@ pub(crate) async fn delete_profile_field_route(
 	if *sender_user != body.user_id && body.appservice_info.is_none() {
 		return Err!(Request(Forbidden("You cannot update the profile of another user")));
 	}
+
+	// MSC3823: displayname/avatar are forbidden during suspension; custom
+	// MSC4133 fields fall through.
+	if matches!(body.field, ProfileFieldName::DisplayName | ProfileFieldName::AvatarUrl)
+		&& services.users.is_suspended(sender_user).await
+	{
+		return Err!(Request(UserSuspended("Account is suspended.")));
+	}
+
+	let propagation = resolve_propagation(
+		&body.propagate_to,
+		propagation_default(
+			services
+				.server
+				.config
+				.preserve_room_profile_overrides,
+		),
+	);
 
 	match body.field {
 		| ProfileFieldName::DisplayName => {
@@ -200,7 +200,7 @@ pub(crate) async fn delete_profile_field_route(
 
 			services
 				.users
-				.update_displayname(&body.user_id, None, &all_joined_rooms)
+				.update_displayname(&body.user_id, None, &all_joined_rooms, propagation)
 				.await;
 		},
 		| ProfileFieldName::AvatarUrl => {
@@ -213,7 +213,7 @@ pub(crate) async fn delete_profile_field_route(
 
 			services
 				.users
-				.update_avatar_url(&body.user_id, None, None, &all_joined_rooms)
+				.update_avatar_url(&body.user_id, None, None, &all_joined_rooms, propagation)
 				.await;
 		},
 		| _ => {
@@ -226,74 +226,18 @@ pub(crate) async fn delete_profile_field_route(
 	// Presence update
 	services
 		.presence
-		.maybe_ping_presence(&body.user_id, body.sender_device.as_deref(), &PresenceState::Online)
+		.maybe_ping_presence(
+			&body.user_id,
+			body.sender_device.as_deref(),
+			Some(client),
+			&PresenceState::Online,
+		)
 		.await?;
 
 	Ok(delete_profile_field::v3::Response {})
 }
 
-/// # `GET /_matrix/client/unstable/uk.tcpip.msc4133/profile/{user_id}/us.cloke.msc4175.tz`
-///
-/// Returns the `timezone` of the user as per MSC4133 and MSC4175.
-///
-/// - If user is on another server and we do not have a local copy already fetch
-///   `timezone` over federation
-pub(crate) async fn get_timezone_key_route(
-	State(services): State<crate::State>,
-	body: Ruma<get_timezone_key::unstable::Request>,
-) -> Result<get_timezone_key::unstable::Response> {
-	if !services.globals.user_is_local(&body.user_id) {
-		// Create and update our local copy of the user
-		if let Ok(response) = services
-			.federation
-			.execute(
-				body.user_id.server_name(),
-				federation::query::get_profile_information::v1::Request {
-					user_id: body.user_id.clone(),
-					field: None, // we want the full user's profile to update locally as well
-				},
-			)
-			.await
-		{
-			if !services.users.exists(&body.user_id).await {
-				services
-					.users
-					.create(&body.user_id, None, None)
-					.await?;
-			}
-
-			services
-				.users
-				.set_displayname(&body.user_id, response.displayname.as_deref());
-
-			services
-				.users
-				.set_avatar_url(&body.user_id, response.avatar_url.as_deref());
-
-			services
-				.users
-				.set_blurhash(&body.user_id, response.blurhash.as_deref());
-
-			services
-				.users
-				.set_timezone(&body.user_id, response.tz.as_deref());
-
-			return Ok(get_timezone_key::unstable::Response { tz: response.tz });
-		}
-	}
-
-	if !services.users.exists(&body.user_id).await {
-		// Return 404 if this user doesn't exist and we couldn't fetch it over
-		// federation
-		return Err(Error::BadRequest(ErrorKind::NotFound, "Profile was not found."));
-	}
-
-	Ok(get_timezone_key::unstable::Response {
-		tz: services.users.timezone(&body.user_id).await.ok(),
-	})
-}
-
-/// # `GET /_matrix/client/unstable/uk.tcpip.msc4133/profile/{userId}/{field}}`
+/// # `GET /_matrix/client/v3/profile/{userId}/{field}`
 ///
 /// Gets the profile key-value field of a user, as per MSC4133.
 ///
@@ -325,26 +269,23 @@ pub(crate) async fn get_profile_field_route(
 
 			services
 				.users
-				.set_displayname(&body.user_id, response.displayname.as_deref());
+				.set_displayname(&body.user_id, profile_str(&response, "displayname"));
 
 			services
 				.users
-				.set_avatar_url(&body.user_id, response.avatar_url.as_deref());
+				.set_avatar_url(&body.user_id, profile_mxc(&response, "avatar_url"));
 
 			services
 				.users
-				.set_blurhash(&body.user_id, response.blurhash.as_deref());
+				.set_blurhash(&body.user_id, profile_str(&response, "blurhash"));
 
 			services
 				.users
-				.set_timezone(&body.user_id, response.tz.as_deref());
+				.set_timezone(&body.user_id, profile_str(&response, "m.tz"));
 
-			let value = response
-				.custom_profile_fields
-				.get(body.field.as_str())
-				.ok_or_else(|| {
-					err!(Request(NotFound("The requested profile key does not exist.")))
-				})?;
+			let value = response.get(body.field.as_str()).ok_or_else(|| {
+				err!(Request(NotFound("The requested profile key does not exist.")))
+			})?;
 
 			services
 				.users

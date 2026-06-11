@@ -76,6 +76,8 @@ pub enum Error {
 	#[error(transparent)]
 	JsTryFromInt(#[from] ruma::JsTryFromIntError), // js_int re-export
 	#[error(transparent)]
+	ObjectStore(#[from] object_store::Error),
+	#[error(transparent)]
 	Path(#[from] axum::extract::rejection::PathRejection),
 	#[error("Mutex poisoned: {0}")]
 	Poison(Cow<'static, str>),
@@ -105,8 +107,16 @@ pub enum Error {
 	// ruma/tuwunel
 	#[error("Arithmetic operation failed: {0}")]
 	Arithmetic(Cow<'static, str>),
+
+	/// State-res `auth_check` rejection sentinel.
+	///
+	/// Surfaces to the wire as 403 / M_FORBIDDEN with the Display text
+	/// `Auth check failed: {inner}`. Exists so callers can pattern-match the
+	/// cause without grepping the message text.
+	#[error("Auth check failed: {0}")]
+	AuthCheck(Box<Self>),
 	#[error("{0}: {1}")]
-	BadRequest(ruma::api::client::error::ErrorKind, &'static str), //TODO: remove
+	BadRequest(ruma::api::error::ErrorKind, &'static str), //TODO: remove
 	#[error("{0}")]
 	BadServerResponse(Cow<'static, str>),
 	#[error(transparent)]
@@ -122,7 +132,9 @@ pub enum Error {
 	#[error("Feature '{0}' is not available on this server.")]
 	FeatureDisabled(Cow<'static, str>),
 	#[error("Remote server {0} responded with: {1}")]
-	Federation(ruma::OwnedServerName, ruma::api::client::error::Error),
+	Federation(ruma::OwnedServerName, ruma::api::error::Error),
+	#[error("{0}: {1:#?}")]
+	HttpJson(http::StatusCode, axum::Json<serde_json::Value>),
 	#[error("{0} in {1}")]
 	InconsistentRoomState(&'static str, ruma::OwnedRoomId),
 	#[error(transparent)]
@@ -136,13 +148,15 @@ pub enum Error {
 	#[error(transparent)]
 	PowerLevels(#[from] ruma::events::room::power_levels::PowerLevelsError),
 	#[error("from {0}: {1}")]
-	Redaction(ruma::OwnedServerName, ruma::canonical_json::RedactionError),
+	Redaction(ruma::OwnedServerName, ruma::canonical_json::CanonicalJsonFieldError),
 	#[error("{0}: {1}")]
-	Request(ruma::api::client::error::ErrorKind, Cow<'static, str>, http::StatusCode),
+	Request(ruma::api::error::ErrorKind, Cow<'static, str>, http::StatusCode),
 	#[error(transparent)]
-	Ruma(#[from] ruma::api::client::error::Error),
+	Ruma(#[from] ruma::api::error::Error),
 	#[error(transparent)]
-	Signatures(#[from] ruma::signatures::Error),
+	Signatures(#[from] ruma::signatures::VerificationError),
+	#[error(transparent)]
+	SignaturesJson(#[from] ruma::signatures::JsonError),
 	#[error("uiaa")]
 	Uiaa(ruma::api::client::uiaa::UiaaInfo),
 
@@ -186,12 +200,16 @@ impl Error {
 
 	/// Returns the Matrix error code / error kind
 	#[inline]
-	pub fn kind(&self) -> ruma::api::client::error::ErrorKind {
-		use ruma::api::client::error::ErrorKind::{FeatureDisabled, NotJson, Unknown};
+	pub fn kind(&self) -> ruma::api::error::ErrorKind {
+		use ruma::api::error::{
+			ErrorKind,
+			ErrorKind::{FeatureDisabled, NotJson, Unknown},
+		};
 
 		match self {
 			| Self::FeatureDisabled(..) => FeatureDisabled,
 			| Self::CanonicalJson(..) | Self::Json(..) => NotJson,
+			| Self::AuthCheck(..) => ErrorKind::forbidden(),
 			| Self::BadRequest(kind, ..) | Self::Request(kind, ..) => kind.clone(),
 			| Self::Federation(_, error) | Self::Ruma(error) =>
 				response::ruma_error_kind(error).clone(),
@@ -205,6 +223,7 @@ impl Error {
 		use http::StatusCode;
 
 		match self {
+			| Self::AuthCheck(..) => StatusCode::FORBIDDEN,
 			| Self::Conflict(_) => StatusCode::CONFLICT, // room alias exists
 			| Self::Federation(_, error) | Self::Ruma(error) => error.status_code,
 			| Self::FeatureDisabled(..)
@@ -215,6 +234,7 @@ impl Error {
 			| Self::BadRequest(kind, ..) => response::bad_request_code(kind),
 			| Self::Request(kind, _, code) => response::status_code(kind, *code),
 			| Self::Io(error) => response::io_error_code(error.kind()),
+			| Self::HttpJson(code, ..) => *code,
 			| Self::Reqwest(error) => error
 				.status()
 				.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),

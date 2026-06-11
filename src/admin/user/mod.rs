@@ -1,10 +1,34 @@
-mod commands;
+mod create_user;
+mod deactivate;
+mod deactivate_all;
+mod delete_device;
+mod delete_room_tag;
+mod force_demote;
+mod force_join_all_local_users;
+mod force_join_list_of_local_users;
+mod force_join_room;
+mod force_leave_room;
+mod force_promote;
+mod get_room_tags;
+mod last_active;
+mod list_joined_rooms;
+mod list_users;
+mod make_user_admin;
+mod put_room_tag;
+mod redact_event;
+mod reject_invites;
+mod reset_password;
 
 use clap::Subcommand;
-use ruma::{OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId};
+use futures::FutureExt;
+use ruma::{OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedRoomOrAliasId, OwnedUserId, UserId};
 use tuwunel_core::Result;
+use tuwunel_service::Services;
 
 use crate::admin_command_dispatch;
+
+const AUTO_GEN_PASSWORD_LENGTH: usize = 25;
+const BULK_JOIN_REASON: &str = "Bulk force joining this room as initiated by the server admin.";
 
 #[admin_command_dispatch]
 #[derive(Debug, Subcommand)]
@@ -93,6 +117,15 @@ pub(super) enum UserCommand {
 		room_id: OwnedRoomOrAliasId,
 	},
 
+	/// - Reject all pending invites for a local user.
+	RejectInvites {
+		user_id: String,
+
+		/// Optional reason attached to each rejection.
+		#[arg(long)]
+		reason: Option<String>,
+	},
+
 	/// - Forces the specified user to drop their power levels to the room
 	///   default, if their permissions allow and the auth check permits
 	ForceDemote {
@@ -150,8 +183,6 @@ pub(super) enum UserCommand {
 	///
 	/// Specify a codeblock of usernames.
 	///
-	/// At least 1 server admin must be in the room to reduce abuse.
-	///
 	/// Requires the `--yes-i-want-to-do-this` flag.
 	ForceJoinListOfLocalUsers {
 		room: OwnedRoomOrAliasId,
@@ -162,8 +193,6 @@ pub(super) enum UserCommand {
 
 	/// - Force joins all local users to the specified room.
 	///
-	/// At least 1 server admin must be in the room to reduce abuse.
-	///
 	/// Requires the `--yes-i-want-to-do-this` flag.
 	ForceJoinAllLocalUsers {
 		room: OwnedRoomOrAliasId,
@@ -171,4 +200,18 @@ pub(super) enum UserCommand {
 		#[arg(long)]
 		yes_i_want_to_do_this: bool,
 	},
+}
+
+async fn deactivate_user(services: &Services, user_id: &UserId, no_leave_rooms: bool) -> Result {
+	if !no_leave_rooms {
+		services
+			.deactivate
+			.full_deactivate(user_id, false)
+			.boxed()
+			.await?;
+	} else {
+		services.users.deactivate_account(user_id).await?;
+	}
+
+	Ok(())
 }

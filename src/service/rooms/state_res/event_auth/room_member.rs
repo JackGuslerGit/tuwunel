@@ -2,14 +2,14 @@ use std::borrow::Borrow;
 
 use futures::future::{join, join3};
 use ruma::{
-	AnyKeyName, SigningKeyId, UserId,
+	AnyKeyName, EventId, SigningKeyId, UserId,
 	events::{StateEventType, room::member::MembershipState},
 	room_version_rules::AuthorizationRules,
 	serde::{Base64, base64::Standard},
 	signatures::verify_canonical_json_bytes,
 };
 use tuwunel_core::{
-	Err, Result, err, is_equal_to,
+	Err, Result, err,
 	matrix::{Event, StateKey},
 };
 
@@ -26,7 +26,7 @@ use super::{
 	},
 };
 
-/// Check whether the given event passes the `m.room.roomber` authorization
+/// Check whether the given event passes the `m.room.member` authorization
 /// rules.
 ///
 /// This assumes that `ruma_signatures::verify_event()` was called previously,
@@ -52,6 +52,18 @@ where
 
 	let target_user = <&UserId>::try_from(state_key)
 		.map_err(|e| err!("invalid `state_key` field in `m.room.member` event: {e}"))?;
+
+	// MSC4361: in a non-federating room, reject members whose state_key
+	// belongs to a remote server. The existing `m.federate` check at the
+	// top of `auth_check` only covers the sender's domain.
+	if !room_create_event.federate()?
+		&& target_user.server_name() != room_create_event.sender().server_name()
+	{
+		return Err!(
+			"MSC4361: room is not federated and target user domain does not match \
+			 `m.room.create` event's sender domain"
+		);
+	}
 
 	let target_membership = room_member_event.membership()?;
 
@@ -131,13 +143,15 @@ where
 	Fut: Future<Output = Result<Pdu>> + Send,
 	Pdu: Event,
 {
-	let mut creators = room_create_event.creators(rules)?;
+	let creator = room_create_event.creator(rules)?;
+	let creators = room_create_event.creators(rules)?;
 
 	let mut prev_events = room_member_event.prev_events();
 
-	let prev_event_is_room_create_event = prev_events
-		.next()
-		.is_some_and(|event_id| event_id.borrow() == room_create_event.event_id().borrow());
+	let prev_event_is_room_create_event = prev_events.next().is_some_and(|event_id| {
+		<EventId as Borrow<str>>::borrow(event_id)
+			== <EventId as Borrow<str>>::borrow(room_create_event.event_id())
+	});
 
 	let prev_event_is_only_room_create_event =
 		prev_event_is_room_create_event && prev_events.next().is_none();
@@ -145,8 +159,9 @@ where
 	// v1-v10, if the only previous event is an m.room.create and the state_key is
 	// the creator, allow.
 	// Since v11, if the only previous event is an m.room.create and the state_key
-	// is the sender of the m.room.create, allow.
-	if prev_event_is_only_room_create_event && creators.any(is_equal_to!(*target_user)) {
+	// is the sender of the m.room.create, allow. additional_creators do not
+	// satisfy this rule; the spec names the create sender singular.
+	if prev_event_is_only_room_create_event && *target_user == *creator {
 		return Ok(());
 	}
 
@@ -557,9 +572,10 @@ where
 	// Since v10, if the join_rule is anything other than knock or knock_restricted,
 	// reject.
 	let join_rule = join_rule?;
-	if join_rule != JoinRule::Knock
-		&& (rules.knock_restricted_join_rule && !matches!(join_rule, JoinRule::KnockRestricted))
-	{
+	let supports_knock = matches!(join_rule, JoinRule::Knock)
+		|| (rules.knock_restricted_join_rule && matches!(join_rule, JoinRule::KnockRestricted));
+
+	if !supports_knock {
 		return Err!(
 			"join rule is not set to knock or knock_restricted, knocking is not allowed"
 		);

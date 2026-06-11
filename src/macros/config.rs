@@ -1,7 +1,13 @@
-use std::{collections::HashSet, fmt::Write as _, fs::OpenOptions, io::Write as _};
+use std::{
+	collections::{BTreeMap, HashSet},
+	ffi::c_int,
+	fmt::Write as _,
+	fs,
+	sync::{Mutex, OnceLock, PoisonError},
+};
 
 use proc_macro::TokenStream;
-use proc_macro2::{Span, TokenStream as TokenStream2};
+use proc_macro2::TokenStream as TokenStream2;
 use quote::{ToTokens, quote};
 use syn::{
 	Error, Expr, ExprLit, Field, Fields, FieldsNamed, ItemStruct, Lit, Meta, MetaList,
@@ -10,17 +16,30 @@ use syn::{
 
 use crate::{
 	Result,
-	utils::{get_simple_settings, is_cargo_build, is_cargo_test},
+	utils::{get_simple_settings, is_cargo_compile, is_cargo_test},
 };
 
 const UNDOCUMENTED: &str = "# This item is undocumented. Please contribute documentation for it.";
 
-const HIDDEN: &[&str] = &["default", "display"];
+const HIDDEN: &[&str] = &["default", "display", "config-example"];
+
+// Per-filename buffer, accumulated across all macro invocations in this rustc
+// process and flushed once at process exit. The `global` section truncates the
+// buffer; subsequent sections append. The flush hook compares the accumulated
+// buffer against the file on disk and only rewrites when content differs, so
+// `cargo check` / `clippy` runs that produce identical output do not bump the
+// file mtime.
+static FILE_BUFFERS: Mutex<BTreeMap<String, Vec<u8>>> = Mutex::new(BTreeMap::new());
+static FLUSH_REGISTERED: OnceLock<()> = OnceLock::new();
+
+unsafe extern "C" {
+	safe fn atexit(cb: extern "C" fn()) -> c_int;
+}
 
 #[expect(clippy::needless_pass_by_value)]
 pub(super) fn example_generator(input: ItemStruct, args: &[Meta]) -> Result<TokenStream> {
-	let write = is_cargo_build() && !is_cargo_test();
-	let additional = generate_example(&input, args, write)?;
+	let emit = is_cargo_compile() && !is_cargo_test();
+	let additional = generate_example(&input, args, emit)?;
 
 	Ok([input.to_token_stream(), additional]
 		.into_iter()
@@ -29,7 +48,7 @@ pub(super) fn example_generator(input: ItemStruct, args: &[Meta]) -> Result<Toke
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<TokenStream2> {
+fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<TokenStream2> {
 	let settings = get_simple_settings(args);
 
 	let section = settings.get("section").ok_or_else(|| {
@@ -50,31 +69,16 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 		.split(' ')
 		.collect();
 
-	let fopts = OpenOptions::new()
-		.write(true)
-		.create(section == "global")
-		.truncate(section == "global")
-		.append(section != "global")
-		.clone();
+	let truncate = section == "global";
+	let mut section_buf = String::new();
 
-	let mut file = write
-		.then(|| {
-			fopts.open(filename).map_err(|e| {
-				let msg = format!("Failed to open file for config generation: {e}");
-				Error::new(Span::call_site(), msg)
-			})
-		})
-		.transpose()?;
-
-	if let Some(file) = file.as_mut() {
+	if emit {
 		if let Some(header) = settings.get("header") {
-			file.write_all(header.as_bytes())
-				.expect("written to config file");
+			section_buf.push_str(header);
 		}
 
 		let pound = if section != "global" { "\n#" } else { "" };
-		file.write_fmt(format_args!("\n\n{pound}[{section}]\n"))
-			.expect("written to config file");
+		write!(&mut section_buf, "\n\n{pound}[{section}]\n").expect("written to section buffer");
 	}
 
 	let mut summary: Vec<TokenStream2> = Vec::new();
@@ -97,15 +101,26 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 				.trim_end()
 				.to_owned();
 
+			// A `reloadable:` directive alone does not satisfy the documentation
+			// request; prepend the undocumented placeholder when prose is absent.
+			let doc = if doc.lines().all(|line| {
+				let body = line.trim_start_matches('#').trim();
+				body.is_empty() || body.starts_with("reloadable:")
+			}) {
+				format!("{undocumented}\n{doc}")
+			} else {
+				doc
+			};
+
 			let doc = if doc.ends_with('#') {
 				format!("{doc}\n")
 			} else {
 				format!("{doc}\n#\n")
 			};
 
-			let default = get_doc_comment_line(field, "default")
-				.or_else(|| get_default(field))
-				.unwrap_or_default();
+			// `config-example` overrides the emitted example value while `default`
+			// continues to document the runtime default separately.
+			let default = example_value(field);
 
 			let default = if !default.is_empty() {
 				format!(" {default}")
@@ -113,12 +128,11 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 				default
 			};
 
-			if let Some(file) = file.as_mut() {
-				file.write_fmt(format_args!("\n{doc}"))
-					.expect("written to config file");
+			if emit {
+				write!(&mut section_buf, "\n{doc}").expect("written to section buffer");
 
-				file.write_fmt(format_args!("#{ident} ={default}\n"))
-					.expect("written to config file");
+				writeln!(&mut section_buf, "#{ident} ={default}")
+					.expect("written to section buffer");
 			}
 
 			let display = get_doc_comment_line(field, "display");
@@ -145,11 +159,12 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 		}
 	}
 
-	if let Some(file) = file.as_mut()
-		&& let Some(footer) = settings.get("footer")
-	{
-		file.write_all(footer.as_bytes())
-			.expect("written to config file");
+	if emit && let Some(footer) = settings.get("footer") {
+		section_buf.push_str(footer);
+	}
+
+	if emit {
+		append_section(filename, truncate, section_buf.as_bytes());
 	}
 
 	let struct_name = &input.ident;
@@ -165,6 +180,40 @@ fn generate_example(input: &ItemStruct, args: &[Meta], write: bool) -> Result<To
 	};
 
 	Ok(display)
+}
+
+fn append_section(filename: &str, truncate: bool, content: &[u8]) {
+	let mut buffers = FILE_BUFFERS
+		.lock()
+		.unwrap_or_else(PoisonError::into_inner);
+
+	let buf = buffers.entry(filename.to_owned()).or_default();
+
+	if truncate {
+		buf.clear();
+	}
+
+	buf.extend_from_slice(content);
+	drop(buffers);
+
+	FLUSH_REGISTERED.get_or_init(|| {
+		atexit(flush_file_buffers);
+	});
+}
+
+extern "C" fn flush_file_buffers() {
+	let buffers = FILE_BUFFERS
+		.lock()
+		.unwrap_or_else(PoisonError::into_inner);
+
+	for (filename, buf) in buffers.iter() {
+		let unchanged =
+			fs::read(filename).is_ok_and(|existing| existing.as_slice() == buf.as_slice());
+
+		if !unchanged {
+			fs::write(filename, buf).ok();
+		}
+	}
 }
 
 fn get_default(field: &Field) -> Option<String> {
@@ -185,9 +234,8 @@ fn get_default(field: &Field) -> Option<String> {
 		let Some(arg) = Punctuated::<Meta, syn::Token![,]>::parse_terminated
 			.parse(tokens.clone().into())
 			.ok()?
-			.iter()
+			.into_iter()
 			.next()
-			.cloned()
 		else {
 			continue;
 		};
@@ -209,6 +257,13 @@ fn get_default(field: &Field) -> Option<String> {
 	}
 
 	None
+}
+
+fn example_value(field: &Field) -> String {
+	get_doc_comment_line(field, "config-example")
+		.or_else(|| get_doc_comment_line(field, "default"))
+		.or_else(|| get_default(field))
+		.unwrap_or_default()
 }
 
 fn get_doc_comment(field: &Field) -> Option<String> {
@@ -284,4 +339,35 @@ fn get_type_name(field: &Field) -> Option<String> {
 		.iter()
 		.next()
 		.map(|segment| segment.ident.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+	use syn::parse_quote;
+
+	use super::{example_value, get_doc_comment};
+
+	#[test]
+	fn config_example_overrides_default_for_generated_example_value() {
+		let field: syn::Field = parse_quote! {
+			#[doc = "config-example: from example"]
+			#[doc = "default: from default"]
+			name: String
+		};
+
+		assert_eq!(example_value(&field), "from example");
+	}
+
+	#[test]
+	fn config_example_is_hidden_from_emitted_comments() {
+		let field: syn::Field = parse_quote! {
+			#[doc = "visible setting docs"]
+			#[doc = "config-example: hidden value"]
+			name: String
+		};
+
+		let comment = get_doc_comment(&field).expect("visible comment to be emitted");
+		assert!(comment.contains("#visible setting docs"));
+		assert!(!comment.contains("config-example:"));
+	}
 }

@@ -1,5 +1,8 @@
 mod watch;
 
+#[cfg(test)]
+mod tests;
+
 use std::{
 	collections::{BTreeMap, btree_map::Entry},
 	sync::Arc,
@@ -291,6 +294,7 @@ fn update_cache_lists(request: &Request, cached: &mut Self) {
 
 #[implement(Connection)]
 fn update_cache_list(request: &request::List, cached: &mut request::List) {
+	cached.ranges.clone_from(&request.ranges);
 	list_or_sticky(&request.room_details.required_state, &mut cached.room_details.required_state);
 
 	match (&request.filters, &mut cached.filters) {
@@ -311,9 +315,7 @@ fn update_cache_list(request: &request::List, cached: &mut request::List) {
 
 #[implement(Connection)]
 fn update_cache_subscriptions(request: &Request, cached: &mut Self) {
-	cached
-		.subscriptions
-		.extend(request.room_subscriptions.clone());
+	cached.subscriptions = request.room_subscriptions.clone();
 }
 
 #[implement(Connection)]
@@ -352,6 +354,7 @@ fn update_cache_typing(request: &Typing, cached: &mut Typing) {
 #[implement(Connection)]
 fn update_cache_to_device(request: &ToDevice, cached: &mut ToDevice) {
 	some_or_sticky(request.enabled.as_ref(), &mut cached.enabled);
+	cached.since.clone_from(&request.since);
 }
 
 #[implement(Connection)]

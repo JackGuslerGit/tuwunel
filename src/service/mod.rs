@@ -1,5 +1,4 @@
 #![expect(refining_impl_trait)]
-#![allow(unused_features)] // 1.96.0-nightly 2026-03-07 bug
 
 mod manager;
 mod migrations;
@@ -15,6 +14,7 @@ pub mod config;
 pub mod deactivate;
 pub mod emergency;
 pub mod federation;
+pub mod fetcher;
 pub mod globals;
 pub mod key_backups;
 pub mod media;
@@ -27,6 +27,7 @@ pub mod resolver;
 pub mod rooms;
 pub mod sending;
 pub mod server_keys;
+pub mod storage;
 pub mod sync;
 pub mod transaction_ids;
 pub mod uiaa;

@@ -1,5 +1,5 @@
 use ruma::events::room::message::RoomMessageEventContent;
-use tokio::time::{Duration, sleep};
+use tokio::task::yield_now;
 use tuwunel_core::{Err, Result, debug, debug_info, error, implement, info};
 
 pub(super) const SIGNAL: &str = "SIGUSR2";
@@ -16,7 +16,7 @@ pub(super) async fn console_auto_start(&self) {
 		.admin_console_automatic
 	{
 		// Allow more of the startup sequence to execute before spawning
-		tokio::task::yield_now().await;
+		yield_now().await;
 		self.console.start();
 	}
 }
@@ -31,7 +31,7 @@ pub(super) async fn console_auto_stop(&self) {
 
 /// Execute admin commands after startup
 #[implement(super::Service)]
-pub(super) async fn startup_execute(&self) -> Result {
+pub async fn startup_execute(&self) -> Result {
 	// List of commands to execute
 	let commands = &self.services.server.config.admin_execute;
 
@@ -46,9 +46,6 @@ pub(super) async fn startup_execute(&self) -> Result {
 			.config
 			.admin_execute_errors_ignore;
 
-	//TODO: remove this after run-states are broadcast
-	sleep(Duration::from_millis(500)).await;
-
 	for (i, command) in commands.iter().enumerate() {
 		if let Err(e) = self.execute_command(i, command.clone()).await
 			&& !errors
@@ -56,7 +53,7 @@ pub(super) async fn startup_execute(&self) -> Result {
 			return Err(e);
 		}
 
-		tokio::task::yield_now().await;
+		yield_now().await;
 	}
 
 	// The smoketest functionality is placed here for now and simply initiates
@@ -98,7 +95,7 @@ pub(super) async fn signal_execute(&self) -> Result {
 			return Err(e);
 		}
 
-		tokio::task::yield_now().await;
+		yield_now().await;
 	}
 
 	Ok(())

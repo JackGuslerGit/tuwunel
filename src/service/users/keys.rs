@@ -2,21 +2,31 @@ use std::{collections::BTreeMap, mem};
 
 use futures::{Stream, StreamExt, TryFutureExt, pin_mut};
 use ruma::{
-	DeviceId, KeyId, OneTimeKeyAlgorithm, OneTimeKeyId, OneTimeKeyName, OwnedKeyId, RoomId, UInt,
-	UserId,
-	api::client::error::ErrorKind,
+	DeviceId, KeyId, OneTimeKeyAlgorithm, OneTimeKeyId, OneTimeKeyName, OwnedKeyId,
+	OwnedOneTimeKeyId, RoomId, UInt, UserId,
 	encryption::{CrossSigningKey, DeviceKeys, OneTimeKey},
 	serde::Raw,
 };
+use serde::{Deserialize, Serialize};
 use tuwunel_core::{
-	Err, Error, Result, debug_error, err, implement,
-	utils::{
-		ReadyExt,
-		stream::{TryExpect, TryIgnore, TryReadyExt},
-		string::Unquoted,
-	},
+	Err, Result, debug_error, err, implement,
+	utils::{BoolExt, ReadyExt, stream::TryIgnore},
 };
-use tuwunel_database::{Deserialized, Ignore, Json};
+use tuwunel_database::{Deserialized, Ignore, Interfix, Json};
+
+/// MSC2732: row stored under `(user, device, algorithm)` in
+/// `userdeviceidalgorithm_fallback`. Fallback keys are not deleted on
+/// claim; the row is rewritten with `used = true`.
+#[derive(Debug, Deserialize, Serialize)]
+struct FallbackEntry {
+	key_id: OwnedOneTimeKeyId,
+	key: Raw<OneTimeKey>,
+	used: bool,
+}
+
+/// Row-key shape of `onetimekeyid4225_otk`: per-device pool keyed by
+/// upload-order count for MSC4225 ordering.
+type OtkRowKey<'a> = (&'a UserId, &'a DeviceId, u64, &'a OneTimeKeyId);
 
 #[implement(super::Service)]
 pub async fn add_one_time_keys<'a, Keys>(
@@ -45,6 +55,10 @@ pub async fn add_one_time_key(
 	one_time_key_key: &KeyId<OneTimeKeyAlgorithm, OneTimeKeyName>,
 	one_time_key_value: &Raw<OneTimeKey>,
 ) -> Result {
+	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
+		return Err!(Database("one-time-key column unavailable"));
+	};
+
 	if !self.device_exists(user_id, device_id).await {
 		return Err!(Database(error!(
 			?user_id,
@@ -66,25 +80,143 @@ pub async fn add_one_time_key(
 		return Err(e);
 	}
 
-	let mut key = user_id.as_bytes().to_vec();
-	key.push(0xFF);
-	key.extend_from_slice(device_id.as_bytes());
-	key.push(0xFF);
-	// TODO: Use DeviceKeyId::to_string when it's available (and update everything,
-	// because there are no wrapping quotation marks anymore)
-	key.extend_from_slice(serde_json::to_string(one_time_key_key)?.as_bytes());
+	// Racy dedup: two concurrent uploads of the same id can both pass this
+	// check and produce duplicate rows that persist until aged out by prune.
+	let prefix = (user_id, device_id, Interfix);
+	let already_present = otk
+		.keys_prefix(&prefix)
+		.ignore_err()
+		.ready_any(|(.., id): OtkRowKey<'_>| id == one_time_key_key)
+		.await;
+
+	if already_present {
+		return Ok(());
+	}
 
 	let count = self.services.globals.next_count();
 
-	self.db
-		.onetimekeyid_onetimekeys
-		.raw_put(key, Json(one_time_key_value));
+	// MSC4225: RocksDB iterates the (user, device) prefix in count_be ascending
+	// order, so /keys/claim issues one-time keys in the order they were uploaded.
+	otk.put(
+		(user_id, device_id, *count, one_time_key_key.as_str()),
+		Json(one_time_key_value),
+	);
 
 	self.db
 		.userid_lastonetimekeyupdate
 		.raw_put(user_id, *count);
 
 	Ok(())
+}
+
+#[implement(super::Service)]
+pub async fn add_fallback_keys<'a, Keys>(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	keys: Keys,
+) -> Result
+where
+	Keys: Iterator<Item = (&'a OneTimeKeyId, &'a Raw<OneTimeKey>)> + Send + 'a,
+{
+	for (id, key) in keys {
+		self.add_fallback_key(user_id, device_id, id, key)
+			.await
+			.ok();
+	}
+
+	Ok(())
+}
+
+#[implement(super::Service)]
+pub async fn add_fallback_key(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	one_time_key_key: &KeyId<OneTimeKeyAlgorithm, OneTimeKeyName>,
+	one_time_key_value: &Raw<OneTimeKey>,
+) -> Result {
+	if !self.device_exists(user_id, device_id).await {
+		return Err!(Database(error!(
+			?user_id,
+			?device_id,
+			"User does not exist or device has no metadata."
+		)));
+	}
+
+	if let Err(e) = one_time_key_value
+		.deserialize()
+		.map_err(Into::into)
+	{
+		debug_error!(
+			?one_time_key_key,
+			?one_time_key_value,
+			"Invalid fallback key JSON submitted by client, skipping: {e}"
+		);
+
+		return Err(e);
+	}
+
+	let entry = FallbackEntry {
+		key_id: one_time_key_key.to_owned(),
+		key: one_time_key_value.clone(),
+		used: false,
+	};
+
+	let key = (user_id, device_id, one_time_key_key.algorithm());
+	self.db
+		.userdeviceidalgorithm_fallback
+		.put(key, Json(&entry));
+
+	let count = self.services.globals.next_count();
+	self.db
+		.userid_lastonetimekeyupdate
+		.raw_put(user_id, *count);
+
+	Ok(())
+}
+
+#[implement(super::Service)]
+pub async fn take_fallback_key(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	algorithm: &OneTimeKeyAlgorithm,
+) -> Result<(OwnedKeyId<OneTimeKeyAlgorithm, OneTimeKeyName>, Raw<OneTimeKey>)> {
+	let key = (user_id, device_id, algorithm);
+	let entry: FallbackEntry = self
+		.db
+		.userdeviceidalgorithm_fallback
+		.qry(&key)
+		.await
+		.deserialized::<Json<_>>()
+		.map(|Json(entry)| entry)
+		.map_err(|_| err!(Request(NotFound("No fallback key found"))))?;
+
+	let updated = FallbackEntry { used: true, ..entry };
+	self.db
+		.userdeviceidalgorithm_fallback
+		.put(key, Json(&updated));
+
+	Ok((updated.key_id, updated.key))
+}
+
+#[implement(super::Service)]
+pub fn unused_fallback_key_algorithms<'a>(
+	&'a self,
+	user_id: &'a UserId,
+	device_id: &'a DeviceId,
+) -> impl Stream<Item = OneTimeKeyAlgorithm> + Send + 'a {
+	type KeyVal = ((Ignore, Ignore, OneTimeKeyAlgorithm), Json<FallbackEntry>);
+
+	let prefix = (user_id, device_id);
+	self.db
+		.userdeviceidalgorithm_fallback
+		.stream_prefix(&prefix)
+		.ignore_err()
+		.ready_filter_map(|((_, _, algorithm), Json(entry)): KeyVal| {
+			entry.used.is_false().then_some(algorithm)
+		})
 }
 
 #[implement(super::Service)]
@@ -104,46 +236,30 @@ pub async fn take_one_time_key(
 	device_id: &DeviceId,
 	key_algorithm: &OneTimeKeyAlgorithm,
 ) -> Result<(OwnedKeyId<OneTimeKeyAlgorithm, OneTimeKeyName>, Raw<OneTimeKey>)> {
-	let count = self.services.globals.next_count();
+	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
+		return Err!(Request(NotFound("No one-time-key found")));
+	};
+
+	let update_count = self.services.globals.next_count();
 	self.db
 		.userid_lastonetimekeyupdate
-		.insert(user_id, count.to_be_bytes());
+		.insert(user_id, update_count.to_be_bytes());
 
-	let mut prefix = user_id.as_bytes().to_vec();
-	prefix.push(0xFF);
-	prefix.extend_from_slice(device_id.as_bytes());
-	prefix.push(0xFF);
-	prefix.push(b'"'); // Annoying quotation mark
-	prefix.extend_from_slice(key_algorithm.as_ref().as_bytes());
-	prefix.push(b':');
-
-	let one_time_keys = self
-		.db
-		.onetimekeyid_onetimekeys
-		.raw_stream_prefix(&prefix)
-		.ready_and_then(|(key, val)| {
-			self.db.onetimekeyid_onetimekeys.remove(key);
-
-			let key = key
-				.rsplit(|&b| b == 0xFF)
-				.next()
-				.ok_or_else(|| err!(Database("OneTimeKeyId in db is invalid.")))?;
-
-			let key = serde_json::from_slice(key)
-				.map_err(|e| err!(Database("OneTimeKeyId in db is invalid. {e}")))?;
-
-			let val = serde_json::from_slice(val)
-				.map_err(|e| err!(Database("OneTimeKeys in db are invalid. {e}")))?;
-
-			Ok((key, val))
-		})
-		.expect_ok();
+	let prefix = (user_id, device_id, Interfix);
+	let one_time_keys = otk
+		.stream_prefix(&prefix)
+		.ignore_err()
+		.ready_filter(|(row, _): &(OtkRowKey<'_>, &[u8])| row.3.algorithm() == *key_algorithm);
 
 	pin_mut!(one_time_keys);
-	one_time_keys
+	let ((user_id, device_id, count, id), val) = one_time_keys
 		.next()
 		.await
-		.ok_or_else(|| err!(Request(NotFound("No one-time-key found"))))
+		.ok_or_else(|| err!(Request(NotFound("No one-time-key found"))))?;
+
+	otk.del((user_id, device_id, count, id));
+
+	Ok((id.into(), serde_json::from_slice(val)?))
 }
 
 #[implement(super::Service)]
@@ -152,25 +268,18 @@ pub async fn count_one_time_keys(
 	user_id: &UserId,
 	device_id: &DeviceId,
 ) -> BTreeMap<OneTimeKeyAlgorithm, UInt> {
-	type KeyVal<'a> = ((Ignore, Ignore, &'a Unquoted), Ignore);
+	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
+		return BTreeMap::new();
+	};
 
-	let mut algorithm_counts = BTreeMap::<OneTimeKeyAlgorithm, _>::new();
-	let query = (user_id, device_id);
-	self.db
-		.onetimekeyid_onetimekeys
-		.stream_prefix(&query)
+	let prefix = (user_id, device_id, Interfix);
+	let algorithm_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = otk
+		.keys_prefix(&prefix)
 		.ignore_err()
-		.ready_for_each(|((Ignore, Ignore, device_key_id), Ignore): KeyVal<'_>| {
-			let one_time_key_id: &OneTimeKeyId = device_key_id
-				.as_str()
-				.try_into()
-				.expect("Invalid DeviceKeyID in database");
-
-			let count: &mut UInt = algorithm_counts
-				.entry(one_time_key_id.algorithm())
-				.or_default();
-
+		.ready_fold(BTreeMap::new(), |mut acc, (.., id): OtkRowKey<'_>| {
+			let count: &mut UInt = acc.entry(id.algorithm()).or_default();
 			*count = count.saturating_add(1_u32.into());
+			acc
 		})
 		.await;
 
@@ -181,25 +290,30 @@ pub async fn count_one_time_keys(
 		.filter_map(Result::ok)
 		.fold(0_usize, usize::saturating_add);
 
-	if total > self.services.config.one_time_key_limit {
-		self.prune_one_time_keys(user_id, device_id).await;
+	let limit = self.services.config.one_time_key_limit;
+	if let Some(excess) = total.checked_sub(limit).filter(|&n| n > 0) {
+		self.prune_one_time_keys(user_id, device_id, excess)
+			.await;
 	}
 
 	algorithm_counts
 }
 
+/// MSC4225: drop the `excess` oldest rows for this `(user, device)`. Forward
+/// iteration over the prefix runs in count_be ascending order, so
+/// `take(excess)` yields the earliest-uploaded rows.
 #[implement(super::Service)]
-pub async fn prune_one_time_keys(&self, user_id: &UserId, device_id: &DeviceId) {
-	use tuwunel_database::keyval::Key;
+pub async fn prune_one_time_keys(&self, user_id: &UserId, device_id: &DeviceId, excess: usize) {
+	let Some(otk) = self.db.onetimekeyid4225_otk.as_ref() else {
+		return;
+	};
 
-	let query = (user_id, device_id);
-	self.db
-		.onetimekeyid_onetimekeys
-		.keys_prefix(&query)
+	let prefix = (user_id, device_id, Interfix);
+	otk.keys_prefix(&prefix)
 		.ignore_err()
-		.skip(self.services.config.one_time_key_limit)
-		.ready_for_each(|key: Key<'_>| {
-			self.db.onetimekeyid_onetimekeys.remove(key);
+		.take(excess)
+		.ready_for_each(|row: OtkRowKey<'_>| {
+			otk.del(row);
 		})
 		.await;
 }
@@ -252,16 +366,10 @@ pub async fn add_cross_signing_keys(
 
 		let self_signing_key_id = self_signing_key_ids
 			.next()
-			.ok_or(Error::BadRequest(
-				ErrorKind::InvalidParam,
-				"Self signing key contained no key.",
-			))?;
+			.ok_or_else(|| err!(Request(InvalidParam("Self signing key contained no key."))))?;
 
 		if self_signing_key_ids.next().is_some() {
-			return Err(Error::BadRequest(
-				ErrorKind::InvalidParam,
-				"Self signing key contained more than one key.",
-			));
+			return Err!(Request(InvalidParam("Self signing key contained more than one key.")));
 		}
 
 		let mut self_signing_key_key = prefix.clone();
@@ -389,21 +497,37 @@ fn keys_changed_user_or_room<'a>(
 
 #[implement(super::Service)]
 pub async fn mark_device_key_update(&self, user_id: &UserId) {
-	let count = self.services.globals.next_count();
+	let update_all_rooms = !self
+		.services
+		.config
+		.device_key_update_encrypted_rooms_only;
 
+	let all_or_is_encrypted = async |room_id: &RoomId| {
+		update_all_rooms
+			|| self
+				.services
+				.state_accessor
+				.is_encrypted_room(room_id)
+				.await
+	};
+
+	let count = self.services.globals.next_count();
+	let user_key = (user_id, *count);
+
+	self.db
+		.keychangeid_userid
+		.put_raw(user_key, user_id);
 	self.services
 		.state_cache
 		.rooms_joined(user_id)
-		// Don't send key updates to unencrypted rooms
-		.filter(|room_id| self.services.state_accessor.is_encrypted_room(room_id))
+		.filter(|room_id| all_or_is_encrypted(*room_id))
 		.ready_for_each(|room_id| {
-			let key = (room_id, *count);
-			self.db.keychangeid_userid.put_raw(key, user_id);
+			let room_key = (room_id, *count);
+			self.db
+				.keychangeid_userid
+				.put_raw(room_key, user_id);
 		})
 		.await;
-
-	let key = (user_id, *count);
-	self.db.keychangeid_userid.put_raw(key, user_id);
 }
 
 #[implement(super::Service)]
@@ -440,6 +564,7 @@ where
 
 	let cleaned = clean_signatures(key, sender_user, user_id, allowed_signatures)?;
 	let raw_value = serde_json::value::to_raw_value(&cleaned)?;
+
 	Ok(Raw::from_json(raw_value))
 }
 
@@ -554,7 +679,7 @@ where
 			mem::replace(signatures, serde_json::Map::with_capacity(new_capacity))
 		{
 			let sid = <&UserId>::try_from(user.as_str())
-				.map_err(|_| Error::bad_database("Invalid user ID in database."))?;
+				.map_err(|e| err!(Database("Invalid user ID in database: {e}")))?;
 
 			if sender_user == Some(user_id) || sid == user_id || allowed_signatures(sid) {
 				signatures.insert(user, signature);

@@ -24,6 +24,7 @@ use crate::{
 };
 
 #[cfg(feature = "jemalloc_conf")]
+#[used]
 #[unsafe(no_mangle)]
 pub static malloc_conf: &[u8] = const_str::concat_bytes!(
 	"tcache:true",
@@ -66,7 +67,7 @@ static GLOBAL_ALLOCS: AtomicU64 = AtomicU64::new(0);
 static COUNT_GLOBAL_ALLOCS: AtomicBool = AtomicBool::new(false);
 static TRACE_GLOBAL_ALLOCS: AtomicBool = AtomicBool::new(false);
 
-#[crate::ctor]
+#[crate::ctor(unsafe)]
 fn _static_initialization() {
 	// SAFETY: Mutable static globals in jemalloc crate; must be initialized
 	// properly and uniquely.

@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use axum::extract::State;
-use axum_client_ip::InsecureClientIp;
 use reqwest::Url;
 use ruma::{
 	MilliSecondsSinceUnixEpoch, Mxc, UserId,
@@ -22,10 +21,10 @@ use tuwunel_core::{
 };
 use tuwunel_service::{
 	Services,
-	media::{CACHE_CONTROL_IMMUTABLE, CORP_CROSS_ORIGIN, Dim, FileMeta, MXC_LENGTH},
+	media::{CACHE_CONTROL_IMMUTABLE, CORP_CROSS_ORIGIN, Dim, MXC_LENGTH, Media},
 };
 
-use crate::Ruma;
+use crate::{ClientIp, Ruma};
 
 /// # `GET /_matrix/client/v1/media/config`
 pub(crate) async fn get_media_config_route(
@@ -51,7 +50,7 @@ pub(crate) async fn get_media_config_route(
 )]
 pub(crate) async fn create_content_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<create_content::v3::Request>,
 ) -> Result<create_content::v3::Response> {
 	let user = body.sender_user();
@@ -69,17 +68,9 @@ pub(crate) async fn create_content_route(
 		.create(mxc, Some(user), Some(&content_disposition), content_type, &body.file)
 		.await?;
 
-	let blurhash = body.generate_blurhash.then(|| {
-		services
-			.media
-			.create_blurhash(&body.file, content_type, filename)
-			.ok()
-			.flatten()
-	});
-
 	Ok(create_content::v3::Response {
 		content_uri: mxc.to_string().into(),
-		blurhash: blurhash.flatten(),
+		blurhash: None,
 	})
 }
 
@@ -94,7 +85,7 @@ pub(crate) async fn create_content_route(
 )]
 pub(crate) async fn create_mxc_uri_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<create_mxc_uri::v1::Request>,
 ) -> Result<create_mxc_uri::v1::Response> {
 	let user = body.sender_user();
@@ -134,7 +125,7 @@ pub(crate) async fn create_mxc_uri_route(
 )]
 pub(crate) async fn create_content_async_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<create_content_async::v3::Request>,
 ) -> Result<create_content_async::v3::Response> {
 	let user = body.sender_user();
@@ -166,7 +157,7 @@ pub(crate) async fn create_content_async_route(
 )]
 pub(crate) async fn get_content_thumbnail_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<get_content_thumbnail::v1::Request>,
 ) -> Result<get_content_thumbnail::v1::Response> {
 	let user = body.sender_user();
@@ -177,14 +168,14 @@ pub(crate) async fn get_content_thumbnail_route(
 		media_id: &body.media_id,
 	};
 
-	let FileMeta {
+	let Media {
 		content,
 		content_type,
 		content_disposition,
 	} = fetch_thumbnail(&services, &mxc, user, body.timeout_ms, &dim).await?;
 
 	Ok(get_content_thumbnail::v1::Response {
-		file: content.expect("entire file contents"),
+		file: content,
 		content_type: content_type.map(Into::into),
 		cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
 		cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
@@ -203,24 +194,22 @@ pub(crate) async fn get_content_thumbnail_route(
 )]
 pub(crate) async fn get_content_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<get_content::v1::Request>,
 ) -> Result<get_content::v1::Response> {
-	let user = body.sender_user();
-
 	let mxc = Mxc {
 		server_name: &body.server_name,
 		media_id: &body.media_id,
 	};
 
-	let FileMeta {
+	let Media {
 		content,
 		content_type,
 		content_disposition,
-	} = fetch_file(&services, &mxc, user, body.timeout_ms, None).await?;
+	} = fetch_file(&services, &mxc, body.timeout_ms, None).await?;
 
 	Ok(get_content::v1::Response {
-		file: content.expect("entire file contents"),
+		file: content,
 		content_type: content_type.map(Into::into),
 		cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
 		cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
@@ -239,24 +228,22 @@ pub(crate) async fn get_content_route(
 )]
 pub(crate) async fn get_content_as_filename_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<get_content_as_filename::v1::Request>,
 ) -> Result<get_content_as_filename::v1::Response> {
-	let user = body.sender_user();
-
 	let mxc = Mxc {
 		server_name: &body.server_name,
 		media_id: &body.media_id,
 	};
 
-	let FileMeta {
+	let Media {
 		content,
 		content_type,
 		content_disposition,
-	} = fetch_file(&services, &mxc, user, body.timeout_ms, Some(&body.filename)).await?;
+	} = fetch_file(&services, &mxc, body.timeout_ms, Some(&body.filename)).await?;
 
 	Ok(get_content_as_filename::v1::Response {
-		file: content.expect("entire file contents"),
+		file: content,
 		content_type: content_type.map(Into::into),
 		cross_origin_resource_policy: Some(CORP_CROSS_ORIGIN.into()),
 		cache_control: Some(CACHE_CONTROL_IMMUTABLE.into()),
@@ -275,7 +262,7 @@ pub(crate) async fn get_content_as_filename_route(
 )]
 pub(crate) async fn get_media_preview_route(
 	State(services): State<crate::State>,
-	InsecureClientIp(client): InsecureClientIp,
+	ClientIp(client): ClientIp,
 	body: Ruma<get_media_preview::v1::Request>,
 ) -> Result<get_media_preview::v1::Response> {
 	let sender_user = body.sender_user();
@@ -318,12 +305,15 @@ async fn fetch_thumbnail(
 	user: &UserId,
 	timeout_ms: Duration,
 	dim: &Dim,
-) -> Result<FileMeta> {
-	let FileMeta {
+) -> Result<Media> {
+	let Media {
 		content,
 		content_type,
 		content_disposition,
-	} = fetch_thumbnail_meta(services, mxc, user, timeout_ms, dim).await?;
+	} = services
+		.media
+		.get_or_fetch_thumbnail(mxc, dim, timeout_ms, user)
+		.await?;
 
 	let content_disposition = Some(make_content_disposition(
 		content_disposition.as_ref(),
@@ -331,7 +321,7 @@ async fn fetch_thumbnail(
 		None,
 	));
 
-	Ok(FileMeta {
+	Ok(Media {
 		content,
 		content_type,
 		content_disposition,
@@ -341,15 +331,17 @@ async fn fetch_thumbnail(
 async fn fetch_file(
 	services: &Services,
 	mxc: &Mxc<'_>,
-	user: &UserId,
 	timeout_ms: Duration,
 	filename: Option<&str>,
-) -> Result<FileMeta> {
-	let FileMeta {
+) -> Result<Media> {
+	let Media {
 		content,
 		content_type,
 		content_disposition,
-	} = fetch_file_meta(services, mxc, user, timeout_ms).await?;
+	} = services
+		.media
+		.get_or_fetch(mxc, timeout_ms)
+		.await?;
 
 	let content_disposition = Some(make_content_disposition(
 		content_disposition.as_ref(),
@@ -357,58 +349,9 @@ async fn fetch_file(
 		filename,
 	));
 
-	Ok(FileMeta {
+	Ok(Media {
 		content,
 		content_type,
 		content_disposition,
 	})
-}
-
-async fn fetch_thumbnail_meta(
-	services: &Services,
-	mxc: &Mxc<'_>,
-	user: &UserId,
-	timeout_ms: Duration,
-	dim: &Dim,
-) -> Result<FileMeta> {
-	if let Some(filemeta) = services
-		.media
-		.get_thumbnail_with_timeout(mxc, dim, timeout_ms)
-		.await?
-	{
-		return Ok(filemeta);
-	}
-
-	if services.globals.server_is_ours(mxc.server_name) {
-		return Err!(Request(NotFound("Local thumbnail not found.")));
-	}
-
-	services
-		.media
-		.fetch_remote_thumbnail(mxc, Some(user), None, timeout_ms, dim)
-		.await
-}
-
-async fn fetch_file_meta(
-	services: &Services,
-	mxc: &Mxc<'_>,
-	user: &UserId,
-	timeout_ms: Duration,
-) -> Result<FileMeta> {
-	if let Some(filemeta) = services
-		.media
-		.get_with_timeout(mxc, timeout_ms)
-		.await?
-	{
-		return Ok(filemeta);
-	}
-
-	if services.globals.server_is_ours(mxc.server_name) {
-		return Err!(Request(NotFound("Local media not found.")));
-	}
-
-	services
-		.media
-		.fetch_remote_content(mxc, Some(user), None, timeout_ms)
-		.await
 }

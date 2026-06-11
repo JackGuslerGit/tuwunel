@@ -6,7 +6,7 @@ use clap::{ArgAction, Parser};
 use tuwunel_core::{
 	Err, Result,
 	config::{Figment, FigmentValue},
-	err, toml,
+	err, is_true, toml,
 	utils::available_parallelism,
 };
 
@@ -125,6 +125,34 @@ pub struct Args {
 	)]
 	pub worker_histogram_buckets: usize,
 
+	/// Write tokio runtime metrics at exit to a file in the directory
+	/// provided. The format will be JSON. The file will be named
+	/// `tuwunel.runtime_metrics.<pid>.json`. The metrics are accumulated for
+	/// the last runtime interval; total value is only obtained if this is the
+	/// first call for the execution.
+	#[arg(
+		long,
+		hide(true),
+		num_args = 0..=1,
+		require_equals(false),
+		env = "TUWUNEL_RUNTIME_METRICS_DIR",
+		default_missing_value = ""
+	)]
+	pub runtime_metrics_dir: Option<PathBuf>,
+
+	/// Write system resource usage (`getrusage(2)`) metrics at exit to a file
+	/// in the directory provided. The format will be JSON. The file will be
+	/// named `tuwunel.runtime_usage.<pid>.json`.
+	#[arg(
+		long,
+		hide(true),
+		num_args = 0..=1,
+		require_equals(false),
+		env = "TUWUNEL_RUNTIME_USAGE_DIR",
+		default_missing_value = ""
+	)]
+	pub runtime_usage_dir: Option<PathBuf>,
+
 	/// Toggles worker affinity feature.
 	#[arg(
 		long,
@@ -189,13 +217,24 @@ pub fn parse() -> Args { Args::parse() }
 
 /// Synthesize any command line options with configuration file options.
 pub fn update(mut config: Figment, args: &Args) -> Result<Figment> {
+	if config
+		.find_value("maintenance")
+		.ok()
+		.as_ref()
+		.and_then(FigmentValue::to_bool)
+		.is_some_and(is_true!())
+	{
+		return Err!(Config("maintenance", "Not permitted to set this option."));
+	}
+
 	if args.read_only {
 		config = config.join(("rocksdb_read_only", true));
 	}
 
 	if args.maintenance || args.read_only {
-		config = config.join(("startup_netburst", false));
+		config = config.join(("maintenance", true));
 		config = config.join(("listening", false));
+		config = config.join(("startup_netburst", false));
 	}
 
 	#[cfg(feature = "console")]

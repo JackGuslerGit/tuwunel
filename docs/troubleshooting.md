@@ -244,3 +244,10 @@ and is not easy for non-developers to understand.
 
 [unbound-tuning]: https://unbound.docs.nlnetlabs.nl/en/latest/topics/core/performance.html
 [unbound-arch]: https://wiki.archlinux.org/title/Unbound
+
+#### Matrix RTC test tool
+
+[testmatrix](https://pypi.org/project/testmatrix/) is a command line tool for testing
+various aspects of a matrix server and guiding debugging. Details for troubleshooting
+Matrix RTC can be found in the Matrix RTC
+[chapter on troubleshooting](./calls/matrix_rtc.md#troubleshooting).

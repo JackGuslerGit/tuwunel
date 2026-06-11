@@ -9,23 +9,44 @@ use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryFutureExt};
 use ruma::{
-	OwnedRoomId, OwnedUserId, UserId,
+	MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
-	events::{GlobalAccountDataEventType, ignored_user_list::IgnoredUserListEvent},
+	events::{
+		GlobalAccountDataEventType,
+		ignored_user_list::IgnoredUserListEvent,
+		invite_permission_config::{InvitePermissionAction, InvitePermissionConfigEvent},
+	},
 };
+use serde::{Deserialize, Serialize};
 use tuwunel_core::{
 	Err, Result, debug_warn, err, is_equal_to,
 	pdu::PduBuilder,
 	trace,
-	utils::{self, ReadyExt, stream::TryIgnore},
+	utils::{
+		self, ReadyExt,
+		stream::{TryIgnore, automatic_width},
+	},
 	warn,
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
-pub use self::{keys::parse_master_key, register::Register};
+pub use self::{
+	keys::parse_master_key,
+	profile::{Propagation, propagation_default},
+	register::Register,
+};
 
 pub const PASSWORD_SENTINEL: &str = "*";
 pub const PASSWORD_DISABLED: &str = "";
+
+/// Forensic record for a moderation action (MSC3823 suspend, MSC3939 lock).
+/// Presence of the row is the load-bearing fact; this body is written but
+/// never read on the hot path.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Moderation {
+	pub when: MilliSecondsSinceUnixEpoch,
+	pub by: OwnedUserId,
+}
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -35,14 +56,20 @@ pub struct Service {
 struct Data {
 	keychangeid_userid: Arc<Map>,
 	keyid_key: Arc<Map>,
-	onetimekeyid_onetimekeys: Arc<Map>,
+	onetimekeyid4225_otk: Option<Arc<Map>>,
 	openidtoken_expiresatuserid: Arc<Map>,
 	logintoken_expiresatuserid: Arc<Map>,
 	todeviceid_events: Arc<Map>,
+	spentrefresh_userdeviceid: Arc<Map>,
 	token_userdeviceid: Arc<Map>,
 	userdeviceid_metadata: Arc<Map>,
 	userdeviceid_token: Arc<Map>,
+	userdeviceidtoken_index: Arc<Map>,
 	userdeviceid_refresh: Arc<Map>,
+	userdeviceid_spentrefresh: Arc<Map>,
+	userdeviceidalgorithm_fallback: Arc<Map>,
+	oidcdevice_userdeviceid: Arc<Map>,
+	oidccskeybypass_userid: Arc<Map>,
 	userfilterid_filter: Arc<Map>,
 	userid_avatarurl: Arc<Map>,
 	userid_blurhash: Arc<Map>,
@@ -50,10 +77,12 @@ struct Data {
 	userid_devicelistversion: Arc<Map>,
 	userid_displayname: Arc<Map>,
 	userid_lastonetimekeyupdate: Arc<Map>,
+	userid_locked: Arc<Map>,
 	userid_masterkeyid: Arc<Map>,
 	userid_password: Arc<Map>,
 	userid_origin: Arc<Map>,
 	userid_selfsigningkeyid: Arc<Map>,
+	userid_suspended: Arc<Map>,
 	userid_usersigningkeyid: Arc<Map>,
 	useridprofilekey_value: Arc<Map>,
 }
@@ -65,14 +94,20 @@ impl crate::Service for Service {
 			db: Data {
 				keychangeid_userid: args.db["keychangeid_userid"].clone(),
 				keyid_key: args.db["keyid_key"].clone(),
-				onetimekeyid_onetimekeys: args.db["onetimekeyid_onetimekeys"].clone(),
+				onetimekeyid4225_otk: args.db.get("onetimekeyid4225_otk").ok().cloned(),
 				openidtoken_expiresatuserid: args.db["openidtoken_expiresatuserid"].clone(),
 				logintoken_expiresatuserid: args.db["logintoken_expiresatuserid"].clone(),
+				oidcdevice_userdeviceid: args.db["oidcdevice_userdeviceid"].clone(),
+				oidccskeybypass_userid: args.db["oidccskeybypass_userid"].clone(),
 				todeviceid_events: args.db["todeviceid_events"].clone(),
+				spentrefresh_userdeviceid: args.db["spentrefresh_userdeviceid"].clone(),
 				token_userdeviceid: args.db["token_userdeviceid"].clone(),
 				userdeviceid_metadata: args.db["userdeviceid_metadata"].clone(),
 				userdeviceid_token: args.db["userdeviceid_token"].clone(),
+				userdeviceidtoken_index: args.db["userdeviceidtoken_index"].clone(),
 				userdeviceid_refresh: args.db["userdeviceid_refresh"].clone(),
+				userdeviceid_spentrefresh: args.db["userdeviceid_spentrefresh"].clone(),
+				userdeviceidalgorithm_fallback: args.db["userdeviceidalgorithm_fallback"].clone(),
 				userfilterid_filter: args.db["userfilterid_filter"].clone(),
 				userid_avatarurl: args.db["userid_avatarurl"].clone(),
 				userid_blurhash: args.db["userid_blurhash"].clone(),
@@ -80,10 +115,12 @@ impl crate::Service for Service {
 				userid_devicelistversion: args.db["userid_devicelistversion"].clone(),
 				userid_displayname: args.db["userid_displayname"].clone(),
 				userid_lastonetimekeyupdate: args.db["userid_lastonetimekeyupdate"].clone(),
+				userid_locked: args.db["userid_locked"].clone(),
 				userid_masterkeyid: args.db["userid_masterkeyid"].clone(),
 				userid_password: args.db["userid_password"].clone(),
 				userid_origin: args.db["userid_origin"].clone(),
 				userid_selfsigningkeyid: args.db["userid_selfsigningkeyid"].clone(),
+				userid_suspended: args.db["userid_suspended"].clone(),
 				userid_usersigningkeyid: args.db["userid_usersigningkeyid"].clone(),
 				useridprofilekey_value: args.db["useridprofilekey_value"].clone(),
 			},
@@ -107,6 +144,17 @@ impl Service {
 					.ignored_users
 					.keys()
 					.any(|blocked_user| blocked_user == sender_user)
+			})
+	}
+
+	/// MSC4380: `m.invite_permission_config.default_action == "block"`.
+	pub async fn invites_blocked(&self, user_id: &UserId) -> bool {
+		self.services
+			.account_data
+			.get_global(user_id, GlobalAccountDataEventType::InvitePermissionConfig)
+			.await
+			.is_ok_and(|event: InvitePermissionConfigEvent| {
+				matches!(event.content.default_action, Some(InvitePermissionAction::Block))
 			})
 	}
 
@@ -175,6 +223,68 @@ impl Service {
 	pub async fn is_active_local(&self, user_id: &UserId) -> bool {
 		self.services.globals.user_is_local(user_id) && self.is_active(user_id).await
 	}
+
+	/// MSC3823: account is suspended (read-mostly mode, sessions retained).
+	pub async fn is_suspended(&self, user_id: &UserId) -> bool {
+		self.db
+			.userid_suspended
+			.get(user_id)
+			.await
+			.is_ok()
+	}
+
+	/// MSC3939: account is locked (401 + soft_logout, sessions retained).
+	pub async fn is_locked(&self, user_id: &UserId) -> bool {
+		self.db.userid_locked.get(user_id).await.is_ok()
+	}
+
+	/// MSC3823: forensic record for the active suspension, if any.
+	pub async fn get_suspension(&self, user_id: &UserId) -> Option<Moderation> {
+		self.db
+			.userid_suspended
+			.get(user_id)
+			.await
+			.deserialized::<Json<_>>()
+			.map(|Json(m)| m)
+			.ok()
+	}
+
+	/// MSC3939: forensic record for the active lock, if any.
+	pub async fn get_lock(&self, user_id: &UserId) -> Option<Moderation> {
+		self.db
+			.userid_locked
+			.get(user_id)
+			.await
+			.deserialized::<Json<_>>()
+			.map(|Json(m)| m)
+			.ok()
+	}
+
+	pub fn set_suspended(&self, user_id: &UserId, by: &UserId) {
+		let entry = Moderation {
+			when: MilliSecondsSinceUnixEpoch::now(),
+			by: by.to_owned(),
+		};
+
+		self.db
+			.userid_suspended
+			.raw_put(user_id, Json(entry));
+	}
+
+	pub fn clear_suspended(&self, user_id: &UserId) { self.db.userid_suspended.remove(user_id); }
+
+	pub fn set_locked(&self, user_id: &UserId, by: &UserId) {
+		let entry = Moderation {
+			when: MilliSecondsSinceUnixEpoch::now(),
+			by: by.to_owned(),
+		};
+
+		self.db
+			.userid_locked
+			.raw_put(user_id, Json(entry));
+	}
+
+	pub fn clear_locked(&self, user_id: &UserId) { self.db.userid_locked.remove(user_id); }
 
 	/// Returns the number of users registered on this server.
 	#[inline]
@@ -361,6 +471,29 @@ impl Service {
 		expires_in
 	}
 
+	/// Verify a login token is valid and return its owner without consuming it.
+	/// Unlike `find_from_login_token`, the token remains in the database
+	/// after this call and can still be consumed later.
+	pub async fn peek_login_token(&self, token: &str) -> Result<OwnedUserId> {
+		let Ok(value) = self
+			.db
+			.logintoken_expiresatuserid
+			.get(token)
+			.await
+		else {
+			return Err!(Request(Forbidden("Login token is unrecognised")));
+		};
+		let (expires_at, user_id): (u64, OwnedUserId) = value.deserialized()?;
+
+		if expires_at < utils::millis_since_unix_epoch() {
+			trace!(?user_id, ?token, "Removing expired login token");
+			self.db.logintoken_expiresatuserid.remove(token);
+			return Err!(Request(Forbidden("Login token is expired")));
+		}
+
+		Ok(user_id)
+	}
+
 	/// Find out which user a login token belongs to.
 	/// Removes the token to prevent double-use attacks.
 	pub async fn find_from_login_token(&self, token: &str) -> Result<OwnedUserId> {
@@ -399,17 +532,27 @@ impl Service {
 		Err!(FeatureDisabled("ldap"))
 	}
 
-	async fn update_all_rooms(&self, user_id: &UserId, rooms: Vec<(PduBuilder, &OwnedRoomId)>) {
-		for (pdu_builder, room_id) in rooms {
-			let state_lock = self.services.state.mutex.lock(room_id).await;
-			if let Err(e) = self
-				.services
-				.timeline
-				.build_and_append_pdu(pdu_builder, user_id, room_id, &state_lock)
-				.await
-			{
-				warn!(%user_id, %room_id, "Failed to update/send new profile join membership update in room: {e}");
-			}
-		}
+	async fn update_all_rooms<'a, S>(&self, user_id: &UserId, rooms: S)
+	where
+		S: Stream<Item = (PduBuilder, &'a OwnedRoomId)> + Send,
+	{
+		rooms
+			.for_each_concurrent(automatic_width(), async |(pdu_builder, room_id)| {
+				let state_lock = self.services.state.mutex.lock(room_id).await;
+				if let Err(e) = self
+					.services
+					.timeline
+					.build_and_append_pdu(pdu_builder, user_id, room_id, &state_lock)
+					.await
+				{
+					warn!(
+						%user_id,
+						%room_id,
+						%e,
+						"Failed to update/send new profile join membership update in room",
+					);
+				}
+			})
+			.await;
 	}
 }

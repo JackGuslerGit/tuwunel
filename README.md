@@ -39,9 +39,11 @@ Switzerland 🇨🇭 where it is currently deployed for citizens.
 - [GHCR](https://github.com/matrix-construct/tuwunel/pkgs/container/tuwunel) or `docker pull ghcr.io/matrix-construct/tuwunel:latest`
 - Static binaries available as [releases](https://github.com/matrix-construct/tuwunel/releases) or [build artifacts](https://github.com/matrix-construct/tuwunel/actions?query=branch%3Amain).
 - Deb and RPM packages available as [releases](https://github.com/matrix-construct/tuwunel/releases) or [build artifacts](https://github.com/matrix-construct/tuwunel/actions?query=branch%3Amain).
-- Arch package available as [tuwunel](https://aur.archlinux.org/packages/tuwunel) or [tuwunel-git](https://aur.archlinux.org/packages/tuwunel-git).
+- Arch package available as [tuwunel](https://aur.archlinux.org/packages/tuwunel).
 - Nix package available as [`matrix-tuwunel`](https://search.nixos.org/packages?query=matrix-tuwunel) and NixOS module available as [`services.matrix-tuwunel`](https://search.nixos.org/options?query=services.matrix-tuwunel).
 - Alpine package available as [tuwunel](https://pkgs.alpinelinux.org/package/edge/testing/x86_64/tuwunel).
+- Gentoo ebuild available in Guru as [net-im/tuwunel](https://gitweb.gentoo.org/repo/proj/guru.git/tree/net-im/tuwunel).
+- Ansible playbook available as [matrix-docker-ansible-deploy](https://github.com/spantaleev/matrix-docker-ansible-deploy/blob/master/docs/configuring-playbook-tuwunel.md).
 
 **1.** [Configure](https://matrix-construct.github.io/tuwunel/configuration.html) by
 copying and editing the `tuwunel-example.toml`. The `server_name` and `database_path` must be
@@ -124,11 +126,11 @@ tagged releases are true releases.
 > [!IMPORTANT]
 > **We strongly advise tracking the `:latest` tag when automatically updating.**
 
-Tracking `:latest` gives us the necessary discretion to keep you on the appropriate stable version.
-We discourage tracking the main branch unless frequent restarts are acceptable. Alternatively,
-tracking the `:preview` tag provides the latest release-candidate becoming equivalent to `:latest`
-after a release. Tracking the `:preview` tag is a worthy alternative to the main branch, with
-turbulence limited to release-time.
+Tracking `:latest` gives us the necessary discretion to keep you on the appropriate stable release
+version. Tracking the `:preview` tag provides select updates of higher confidence between releases.
+Tracking the `:main` branch provides the most frequent updates which have been reviewed and tested
+with confidence for release, the only remaining risk being the unknown. The publication frequency
+for these tags are on average monthly, weekly and daily, respectively.
 
 ### Getting Help & Support
 

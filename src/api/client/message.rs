@@ -13,7 +13,7 @@ use tuwunel_core::{
 	Err, Result, at,
 	matrix::{
 		event::{Event, Matches},
-		pdu::PduCount,
+		pdu::{PduCount, PduEvent},
 	},
 	ref_at,
 	utils::{
@@ -33,25 +33,26 @@ use tuwunel_service::{
 
 use crate::Ruma;
 
-/// list of safe and common non-state events to ignore if the user is ignored
+/// list of safe and common non-state events to ignore if the user is ignored.
+/// MUST be sorted by `TimelineEventType::event_type_str()` for `binary_search`.
 const IGNORED_MESSAGE_TYPES: &[TimelineEventType] = &[
-	Audio,
-	CallInvite,
-	Emote,
-	File,
-	Image,
-	KeyVerificationStart,
-	Location,
-	PollStart,
-	UnstablePollStart,
-	Beacon,
-	Reaction,
-	RoomEncrypted,
-	RoomMessage,
-	Sticker,
-	Video,
-	Voice,
-	CallNotify,
+	CallInvite,           // m.call.invite
+	KeyVerificationStart, // m.key.verification.start
+	Location,             // m.location
+	PollStart,            // m.poll.start
+	Reaction,             // m.reaction
+	RoomEncrypted,        // m.room.encrypted
+	RoomMessage,          // m.room.message
+	Sticker,              // m.sticker
+	Audio,                // org.matrix.msc1767.audio
+	Emote,                // org.matrix.msc1767.emote
+	File,                 // org.matrix.msc1767.file
+	Image,                // org.matrix.msc1767.image
+	Video,                // org.matrix.msc1767.video
+	Voice,                // org.matrix.msc3245.voice.v2
+	UnstablePollStart,    // org.matrix.msc3381.poll.start
+	Beacon,               // org.matrix.msc3672.beacon
+	CallNotify,           // org.matrix.msc4075.call.notify
 ];
 
 const LIMIT_MAX: usize = 1000;
@@ -118,11 +119,17 @@ pub(crate) async fn get_message_events_route(
 		),
 	};
 
+	let encrypted = services
+		.state_accessor
+		.is_encrypted_room(room_id)
+		.await;
+
 	let events: Vec<_> = it
 		.ready_take_while(|(count, _)| Some(*count) != to)
 		.ready_filter_map(|item| event_filter(item, filter))
 		.wide_filter_map(|item| event_filters(&services, sender_user, item))
 		.take(limit)
+		.wide_then(|item| add_membership_unsigned(&services, item, sender_user, encrypted))
 		.collect()
 		.await;
 
@@ -132,6 +139,7 @@ pub(crate) async fn get_message_events_route(
 		room_id,
 		token: Some(from.into_unsigned()),
 		options: Some(&filter.lazy_load_options),
+		mode: lazy_loading::Mode::Update,
 	};
 
 	let witness = filter
@@ -275,8 +283,7 @@ where
 
 	let ignored_server = services
 		.config
-		.forbidden_remote_server_names
-		.is_match(event.sender().server_name().host());
+		.is_forbidden_remote_server_name(event.sender().server_name());
 
 	ignored_server
 		|| services
@@ -306,7 +313,53 @@ pub(crate) fn event_filter(item: PdusIterItem, filter: &RoomEventFilter) -> Opti
 	filter.matches(pdu).then_some(item)
 }
 
-#[cfg_attr(debug_assertions, tuwunel_core::ctor)]
+/// MSC4115: stamp `unsigned.membership` on a served PDU with the requesting
+/// user's membership at the time of the event. The MSC permits omitting the
+/// property when calculating it is expensive, so the project restricts it to
+/// encrypted rooms where membership-vs-event ordering matters for key share.
+#[inline]
+pub(crate) async fn annotate_membership(
+	services: &Services,
+	pdu: &mut PduEvent,
+	user_id: &UserId,
+	encrypted: bool,
+) {
+	if !encrypted {
+		return;
+	}
+
+	let membership = services
+		.state_accessor
+		.user_membership_at_pdu(user_id, pdu)
+		.await;
+
+	pdu.add_membership(&membership).log_err().ok();
+}
+
+/// `annotate_membership` consume-and-return adapter for stream chains.
+#[inline]
+pub(crate) async fn with_membership(
+	services: &Services,
+	mut pdu: PduEvent,
+	user_id: &UserId,
+	encrypted: bool,
+) -> PduEvent {
+	annotate_membership(services, &mut pdu, user_id, encrypted).await;
+	pdu
+}
+
+/// `with_membership` adapter for timeline-iterator items.
+#[inline]
+pub(crate) async fn add_membership_unsigned(
+	services: &Services,
+	(count, pdu): PdusIterItem,
+	user_id: &UserId,
+	encrypted: bool,
+) -> PdusIterItem {
+	(count, with_membership(services, pdu, user_id, encrypted).await)
+}
+
+#[cfg_attr(debug_assertions, tuwunel_core::ctor(unsafe))]
 fn _is_sorted() {
 	debug_assert!(
 		IGNORED_MESSAGE_TYPES.is_sorted(),

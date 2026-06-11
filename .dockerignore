@@ -5,16 +5,17 @@ target/
 # Docker files
 Dockerfile*
 docker/
+!docker/playwright.tuwunel.ts
+!docker/snippets/
+!docker/snippets/*
 
 # IDE files
 .vscode
 .idea
 *.iml
 
-.
-
 # Git folder
-#.git
+.git
 #.gitea
 #.gitlab
 #.github

@@ -2,9 +2,15 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use futures::{Stream, StreamExt, TryFutureExt};
 use ruma::{
-	CanonicalJsonValue, EventId, OwnedUserId, RoomId, UserId,
-	api::client::threads::get_threads::v1::IncludeThreads, events::relation::BundledThread, uint,
+	CanonicalJsonValue, EventId, OwnedEventId, OwnedUserId, RoomId, UserId,
+	api::client::threads::get_threads::v1::IncludeThreads,
+	events::{
+		TimelineEventType,
+		relation::{BundledThread, RelationType},
+	},
+	uint,
 };
+use serde::Deserialize;
 use serde_json::json;
 use tuwunel_core::{
 	Event, Result, err,
@@ -16,6 +22,22 @@ use tuwunel_core::{
 	},
 };
 use tuwunel_database::{Deserialized, Interfix, Map};
+
+/// Maximum relation hops walked when resolving thread membership, per
+/// the Matrix v1.4 spec recommendation (also MSC3771/MSC3773).
+const MAX_THREAD_HOPS: usize = 3;
+
+#[derive(Deserialize)]
+struct ExtractThreadRelation {
+	#[serde(rename = "m.relates_to")]
+	relates_to: ThreadRelation,
+}
+
+#[derive(Deserialize)]
+struct ThreadRelation {
+	rel_type: RelationType,
+	event_id: OwnedEventId,
+}
 
 pub struct Service {
 	db: Data,
@@ -40,6 +62,84 @@ impl crate::Service for Service {
 }
 
 impl Service {
+	/// Resolves the thread root for `event` by walking up `m.relates_to`
+	/// links, bounded at `MAX_THREAD_HOPS`. Returns `None` for events
+	/// that belong to the main timeline. Redaction events carry no
+	/// `m.relates_to` of their own; their thread is resolved from the
+	/// redacted target event per MSC3771/MSC3773.
+	pub async fn get_thread_id<E>(&self, event: &E) -> Option<OwnedEventId>
+	where
+		E: Event,
+	{
+		let initial = match event.get_content::<ExtractThreadRelation>() {
+			| Ok(t) => Some(t.relates_to),
+			| Err(_) => self.relates_to_via_redaction_target(event).await,
+		};
+
+		let mut relates_to = initial?;
+
+		for _ in 0..MAX_THREAD_HOPS {
+			if relates_to.rel_type == RelationType::Thread {
+				return Some(relates_to.event_id);
+			}
+
+			relates_to = self
+				.services
+				.timeline
+				.get_pdu(&relates_to.event_id)
+				.await
+				.ok()?
+				.get_content::<ExtractThreadRelation>()
+				.ok()?
+				.relates_to;
+		}
+
+		None
+	}
+
+	/// Resolve a redaction event's thread by looking through to the
+	/// redacted target. Returns `None` for non-redaction events and for
+	/// redactions whose target is unknown or carries no thread relation.
+	async fn relates_to_via_redaction_target<E>(&self, event: &E) -> Option<ThreadRelation>
+	where
+		E: Event,
+	{
+		if *event.kind() != TimelineEventType::RoomRedaction {
+			return None;
+		}
+
+		let room_rules = self
+			.services
+			.state
+			.get_room_version_rules(event.room_id())
+			.await
+			.ok()?;
+
+		let target_id = event.redacts_id(&room_rules)?;
+
+		self.services
+			.timeline
+			.get_pdu(&target_id)
+			.await
+			.ok()?
+			.get_content::<ExtractThreadRelation>()
+			.ok()
+			.map(|t| t.relates_to)
+	}
+
+	/// `get_thread_id` for an event referenced by id; events missing
+	/// locally resolve to `None` (the main timeline).
+	pub async fn get_thread_id_for_event(&self, event_id: &EventId) -> Option<OwnedEventId> {
+		let pdu = self
+			.services
+			.timeline
+			.get_pdu(event_id)
+			.await
+			.ok()?;
+
+		self.get_thread_id(&pdu).await
+	}
+
 	pub async fn add_to_thread<E>(&self, root_event_id: &EventId, event: &E) -> Result
 	where
 		E: Event,

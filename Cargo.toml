@@ -30,7 +30,7 @@ license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/matrix-construct/tuwunel"
 rust-version = "1.94.0"
-version = "1.5.1"
+version = "1.7.1"
 
 [workspace.metadata.crane]
 name = "tuwunel"
@@ -70,9 +70,6 @@ features = [
 	"tracing",
 ]
 
-[workspace.dependencies.axum-client-ip]
-version = "0.7"
-
 [workspace.dependencies.axum-extra]
 version = "0.12"
 default-features = false
@@ -95,19 +92,13 @@ default-features = false
 version = "0.22"
 default-features = false
 
-[workspace.dependencies.blurhash]
-version = "0.2"
-default-features = false
-features = [
-	"fast-linear-to-srgb",
-	"image",
-]
-
 [workspace.dependencies.bytes]
 version = "1.11"
 
 [workspace.dependencies.bytesize]
 version = "2.3"
+default-features = false
+features = ["serde", "std"]
 
 [workspace.dependencies.cargo_toml]
 version = "0.22"
@@ -123,7 +114,7 @@ features = ["alloc", "std"]
 default-features = false
 
 [workspace.dependencies.clap]
-version = "4.5"
+version = "4.6"
 default-features = false
 features = [
 	"derive",
@@ -135,18 +126,18 @@ features = [
 	"usage",
 ]
 
-# Disabled until Axum updated. Remember to remove cfgs for tuwunel_disable.
-#[workspace.dependencies.console-subscriber]
-#version = "0.4"
+[workspace.dependencies.console-subscriber]
+version = "0.5"
 
 [workspace.dependencies.core_affinity]
 version = "0.8.3"
 
 [workspace.dependencies.const-str]
 version = "1.1"
+features = ["proc"]
 
 [workspace.dependencies.criterion]
-version = "0.7"
+version = "0.8"
 default-features = false
 features = [
 	"cargo_bench_support",
@@ -155,10 +146,18 @@ features = [
 ]
 
 [workspace.dependencies.ctor]
-version = "0.5"
+version = "1.0"
+
+[workspace.dependencies.dtor]
+version = "1.0"
 
 [workspace.dependencies.cyborgtime]
 version = "2.1"
+
+[workspace.dependencies.derive_more]
+version = "2.1"
+default-features = false
+features = ["debug"]
 
 [workspace.dependencies.either]
 version = "1.15"
@@ -173,10 +172,13 @@ features = ["env", "toml"]
 [workspace.dependencies.futures]
 version = "0.3"
 default-features = false
-features = ["std", "async-await"]
+features = [
+	"async-await",
+	"std",
+]
 
 [workspace.dependencies.hickory-resolver]
-version = "0.25"
+version = "0.26"
 default-features = false
 features = [
 	"serde",
@@ -214,13 +216,19 @@ features = [
 ]
 
 [workspace.dependencies.insta]
-version = "1.43"
+version = "1.47"
 features = [
 	"json",
 ]
 
 [workspace.dependencies.ipaddress]
 version = "0.1"
+
+[workspace.dependencies.ipnet]
+version = "2.12"
+features = [
+	"serde",
+]
 
 [workspace.dependencies.itertools]
 version = "0.14"
@@ -250,7 +258,7 @@ features = ["sync", "tls-rustls"]
 version = "0.2"
 
 [workspace.dependencies.libloading]
-version = "0.8"
+version = "0.9"
 
 [workspace.dependencies.log]
 version = "0.4"
@@ -278,23 +286,41 @@ version = "0"
 default-features = false
 features = [
 	"resource",
+	"socket",
 	"user",
 ]
+
+[workspace.dependencies.num_cpus]
+version = "1"
 
 [workspace.dependencies.num-traits]
 version = "0.2"
 
-[workspace.dependencies.opentelemetry]
-version = "0.31"
+[workspace.dependencies.object_store]
+version = "0.13"
+default-features = false
+features = [
+	"aws",
+	"fs",
+	"tls-webpki-roots",
+]
 
-# Disabled until they move to opentelemetry 0.30
-#[workspace.dependencies.opentelemetry-jaeger]
-#version = "0.22.0"
-#features = ["rt-tokio"]
+[workspace.dependencies.opentelemetry]
+version = "0.32"
+
+[workspace.dependencies.opentelemetry-otlp]
+version = "0.32"
+default-features = false
+features = [
+	"grpc-tonic",
+	"trace",
+]
 
 [workspace.dependencies.opentelemetry_sdk]
-version = "0.31"
-features = ["rt-tokio"]
+version = "0.32"
+
+[workspace.dependencies.pin-project-lite]
+version = "0.2"
 
 [workspace.dependencies.proc-macro2]
 version = "1.0"
@@ -303,7 +329,7 @@ version = "1.0"
 version = "1.0"
 
 [workspace.dependencies.rand]
-version = "0.8"
+version = "0.10"
 
 [workspace.dependencies.regex]
 version = "1.12"
@@ -313,11 +339,9 @@ version = "0.13"
 default-features = false
 features = [
 	"charset",
-	"hickory-dns",
 	"http2",
 	"json",
 	"rustls",
-	"rustls-native-certs",
 	"socks",
 ]
 
@@ -327,7 +351,7 @@ default-features = false
 
 [workspace.dependencies.ruma]
 git = "https://github.com/matrix-construct/ruma"
-rev = "30d063c4503c3b630cdd55eda71a0bc3504518a2"
+rev = "0b7aad2371a7b51a8226d819b544c1ca9edeb696"
 features = [
     "__compat",
     "appservice-api-c",
@@ -336,6 +360,7 @@ features = [
     "compat-upload-signatures",
     "federation-api",
     "identifiers-validation",
+    "identity-service-api",
     "markdown",
     "push-gateway-api-c",
     "rand",
@@ -347,7 +372,9 @@ features = [
     "unstable-msc2870",
     "unstable-msc3026",
     "unstable-msc3061",
+    "unstable-msc3391",
     "unstable-msc3814",
+    "unstable-msc3824",
     "unstable-msc3245",
     "unstable-msc3381", # polls
     "unstable-msc3489", # beacon / live location
@@ -359,11 +386,22 @@ features = [
     "unstable-msc4133",
     "unstable-msc4143",
     "unstable-msc4186",
-    "unstable-msc4203", # sending to-device events to appservices 
+    "unstable-msc4195",
+    "unstable-msc4203", # sending to-device events to appservices
+    "unstable-msc4265",
+    "unstable-msc4266",
     "unstable-msc4310",
     "unstable-msc4311",
+    "unstable-msc4383",
+    "unstable-msc4439",
+    "unstable-msc4466",
     "unstable-extensible-events",
 ]
+
+[workspace.dependencies.synapse-admin-api]
+git = "https://github.com/matrix-construct/synapse-admin-api"
+rev = "d8e73952506a09f280a7c253003fafc131206612"
+features = ["server"]
 
 [workspace.dependencies.rustls]
 version = "0.23"
@@ -392,11 +430,11 @@ features = [
 version = "0.6"
 
 [workspace.dependencies.sd-notify]
-version = "0.4"
+version = "0.5"
 default-features = false
 
 [workspace.dependencies.sentry]
-version = "0.46"
+version = "0.48"
 default-features = false
 features = [
     "backtrace",
@@ -412,10 +450,10 @@ features = [
 ]
 
 [workspace.dependencies.sentry-tower]
-version = "0.46"
+version = "0.48"
 
 [workspace.dependencies.sentry-tracing]
-version = "0.46"
+version = "0.48"
 
 [workspace.dependencies.serde]
 version = "1.0"
@@ -427,7 +465,7 @@ version = "1.0"
 default-features = false
 
 [workspace.dependencies.serde_html_form]
-version = "0.2"
+version = "0.4"
 
 [workspace.dependencies.serde_json]
 version = "1.0"
@@ -449,7 +487,7 @@ version = "0.10"
 default-features = false
 
 [workspace.dependencies.similar]
-version = "2.7"
+version = "3.1"
 
 [workspace.dependencies.smallstr]
 version = "0.3"
@@ -490,7 +528,7 @@ version = "2.0"
 default-features = false
 
 [workspace.dependencies.tokio]
-version = "1.50"
+version = "1.52"
 default-features = false
 features = [
 	"fs",
@@ -505,7 +543,7 @@ features = [
 ]
 
 [workspace.dependencies.tokio-metrics]
-version = "0.4"
+version = "0.5"
 
 [workspace.dependencies.toml]
 version = "1.0"
@@ -543,7 +581,7 @@ default-features = false
 version = "0.2"
 
 [workspace.dependencies.tracing-opentelemetry]
-version = "0.32"
+version = "0.33"
 
 [workspace.dependencies.tracing-subscriber]
 version = "0.3"
@@ -659,11 +697,13 @@ inherits = "release"
 debug = "full"
 strip = "none"
 
+[profile.release-debuginfo.package.'*']
+debug = "limited"
+
 # do not use without profile-rustflags enabled. uncomment ALL the sections for
 # profile.release-native
 [profile.release-native]
 inherits = "release"
-strip = "symbols"
 lto = "fat"
 #rustflags = [
 #	'-Ctarget-cpu=native',
@@ -673,7 +713,6 @@ lto = "fat"
 #	'-Ztls-model=local-exec',
 #	'-Zinline-mir=true',
 #	'-Zmir-opt-level=3',
-#	'-Clink-arg=-Wl,--gc-sections',
 #	'-Ztime-passes',
 #	'-Ztime-llvm-passes',
 #]
@@ -696,7 +735,6 @@ inherits = "release-native.build-override"
 #]
 
 [profile.bench]
-debug = "limited"
 strip = "none"
 #rustflags = [
 #	"-Cremark=all",
@@ -737,7 +775,6 @@ debug = 0
 #]
 
 [profile.dev.package.tuwunel_core]
-inherits = "dev"
 incremental = false
 #rustflags = [
 #	'--cfg', 'tuwunel_mods',
@@ -758,7 +795,6 @@ incremental = false
 #]
 
 [profile.dev.package.tuwunel]
-inherits = "dev"
 #rustflags = [
 #	'--cfg', 'tuwunel_mods',
 #	'-Ztime-passes',
@@ -776,11 +812,10 @@ inherits = "dev"
 #]
 
 [profile.dev.package.'*']
-inherits = "dev"
 debug = 0
-incremental = false
-codegen-units = 1
+strip = "symbols"
 opt-level = 'z'
+incremental = false
 #rustflags = [
 #	'--cfg', 'tuwunel_mods',
 #	'-Ztls-model=global-dynamic',
@@ -798,19 +833,21 @@ opt-level = 'z'
 [profile.dbg]
 inherits = "dev"
 debug = "full"
+incremental = false
 
 [profile.dbg.package.'*']
-inherits = "dbg"
 debug = "limited"
+codegen-units = 1
+opt-level = 'z'
 
 # primarily used for CI
 [profile.test]
 debug = "limited"
+incremental = false
 
 [profile.test.package.'*']
-inherits = "test"
-incremental = false
-codegen-units = 1
+debug = 0
+strip = "symbols"
 opt-level = 'z'
 
 ###############################################################################
@@ -913,6 +950,7 @@ redundant_pub_crate = { level = "allow", priority = 1 }              # TODO
 significant_drop_in_scrutinee = { level = "allow", priority = 1 }    # TODO
 significant_drop_tightening = { level = "allow", priority = 1 }      # TODO
 tuple_array_conversions = { level = "allow", priority = 1 }
+unused_async_trait_impl = { level = "allow", priority = 1 }          # trait-mandated async (FromRequestParts, #[admin_command])
 
 ###################
 pedantic = { level = "warn", priority = -1 }
@@ -921,6 +959,7 @@ pedantic = { level = "warn", priority = -1 }
 too_long_first_doc_paragraph = { level = "allow", priority = 1 }
 default_trait_access = { level = "allow", priority = 1 }
 doc_markdown = { level = "allow", priority = 1 }
+elidable_lifetime_names = { level = "allow", priority = 1 }
 enum_glob_use = { level = "allow", priority = 1 }
 if_not_else = { level = "allow", priority = 1 }
 if_then_some_else_none = { level = "allow", priority = 1 }

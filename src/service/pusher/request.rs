@@ -3,29 +3,27 @@ use std::{fmt::Debug, mem};
 use bytes::BytesMut;
 use ipaddress::IPAddress;
 use ruma::api::{
-	IncomingResponse, MatrixVersion, OutgoingRequest, SendAccessToken, SupportedVersions,
+	IncomingResponse, OutgoingRequest, auth_scheme::AuthScheme, path_builder::PathBuilder,
 };
 use tuwunel_core::{
 	Err, Result, debug_warn, err, implement, trace, utils::string_from_bytes, warn,
 };
+
+use crate::client::read_response_capped;
 
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip_all)]
 pub(super) async fn send_request<T>(&self, dest: &str, request: T) -> Result<T::IncomingResponse>
 where
 	T: OutgoingRequest + Debug + Send,
+	for<'a> T::Authentication: AuthScheme<Input<'a> = ()>,
+	for<'a> T::PathBuilder: PathBuilder<Input<'a> = ()>,
 {
-	const VERSIONS: [MatrixVersion; 1] = [MatrixVersion::V1_0];
-	let supported = SupportedVersions {
-		versions: VERSIONS.into(),
-		features: Default::default(),
-	};
-
 	let dest = dest.replace(&self.services.config.notification_push_path, "");
 	trace!("Push gateway destination: {dest}");
 
 	let http_request = request
-		.try_into_http_request::<BytesMut>(&dest, SendAccessToken::IfRequired(""), &supported)
+		.try_into_http_request::<BytesMut>(&dest, (), ())
 		.map_err(|e| {
 			err!(BadServerResponse(warn!(
 				"Failed to find destination {dest} for push gateway: {e}"
@@ -74,7 +72,8 @@ where
 					.expect("http::response::Builder is usable"),
 			);
 
-			let body = response.bytes().await?; // TODO: handle timeout
+			let limit = self.services.config.max_response_size;
+			let body = read_response_capped(response, limit).await?;
 
 			if !status.is_success() {
 				debug_warn!("Push gateway response body: {:?}", string_from_bytes(&body));

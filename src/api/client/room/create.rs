@@ -1,16 +1,20 @@
 use std::collections::BTreeMap;
 
 use axum::extract::State;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
+use itertools::Itertools;
 use ruma::{
 	CanonicalJsonObject, EventEncryptionAlgorithm, Int, OwnedRoomAliasId, OwnedRoomId,
-	OwnedUserId, RoomId, RoomVersionId,
+	OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
 	api::client::room::{
-		self, create_room,
-		create_room::v3::{CreationContent, RoomPreset},
+		self,
+		create_room::{
+			self, RoomPowerLevelsContentOverride,
+			v3::{CreationContent, RoomPreset},
+		},
 	},
 	events::{
-		TimelineEventType,
+		StateEventType, TimelineEventType,
 		room::{
 			canonical_alias::RoomCanonicalAliasEventContent,
 			create::RoomCreateEventContent,
@@ -21,40 +25,28 @@ use ruma::{
 			member::{MembershipState, RoomMemberEventContent},
 			name::RoomNameEventContent,
 			power_levels::RoomPowerLevelsEventContent,
-			topic::{RoomTopicEventContent, TopicContentBlock},
+			topic::RoomTopicEventContent,
 		},
 	},
 	int,
 	room_version_rules::{RoomIdFormatVersion, RoomVersionRules},
 	serde::{JsonObject, Raw},
 };
-use serde_json::{json, value::to_raw_value};
+use serde::Deserialize;
+use serde_json::{
+	json,
+	value::{RawValue, to_raw_value},
+};
 use tuwunel_core::{
 	Err, Result, debug_info, debug_warn, err, info,
 	matrix::{StateKey, pdu::PduBuilder, room_version},
-	utils::{BoolExt, option::OptionExt},
+	utils::{BoolExt, IterStream, ReadyExt, option::OptionExt},
 	warn,
 };
 use tuwunel_service::{Services, appservice::RegistrationInfo, rooms::state::RoomMutexGuard};
 
 use crate::{Ruma, client::utils::invite_check};
 
-/// # `POST /_matrix/client/v3/createRoom`
-///
-/// Creates a new room.
-///
-/// - Room ID is randomly generated
-/// - Create alias if `room_alias_name` is set
-/// - Send create event
-/// - Join sender user
-/// - Send power levels event
-/// - Send canonical room alias
-/// - Send join rules
-/// - Send history visibility
-/// - Send guest access
-/// - Send events listed in initial state
-/// - Send events implied by `name` and `topic`
-/// - Send invite events
 pub(crate) async fn create_room_route(
 	State(services): State<crate::State>,
 	body: Ruma<create_room::v3::Request>,
@@ -70,11 +62,6 @@ pub(crate) async fn create_room_route(
 			| room::Visibility::Public => RoomPreset::PublicChat,
 			| _ => RoomPreset::PrivateChat, // Room visibility should not be custom
 		});
-
-	let alias = body
-		.room_alias_name
-		.as_ref()
-		.map_async(|alias| room_alias_check(&services, alias, body.appservice_info.as_ref()));
 
 	// Determine room version
 	let (room_version, version_rules) = body
@@ -93,7 +80,12 @@ pub(crate) async fn create_room_route(
 		.and_then(|version| Ok((version, room_version::rules(version)?)))?;
 
 	// Error on existing alias before committing to creation.
-	let alias = alias.await.transpose()?;
+	let alias = body
+		.room_alias_name
+		.as_ref()
+		.map_async(|alias| room_alias_check(&services, alias, body.appservice_info.as_ref()))
+		.await
+		.transpose()?;
 
 	// Increment and hold the counter; the room will sync atomically to clients
 	// which is preferable.
@@ -111,8 +103,85 @@ pub(crate) async fn create_room_route(
 				})?,
 	};
 
-	// 2. Let the room creator join
 	let sender_user = body.sender_user();
+
+	// 2. Let the room creator join
+	apply_creator_join_pdu(&services, &body, sender_user, &room_id, &state_lock)
+		.boxed()
+		.await?;
+
+	// 3. Power levels
+	apply_power_levels_pdu(
+		&services,
+		&body,
+		&preset,
+		&version_rules,
+		sender_user,
+		&room_id,
+		&state_lock,
+	)
+	.boxed()
+	.await?;
+
+	// 4. Canonical room alias
+	if let Some(room_alias_id) = &alias {
+		apply_canonical_alias_pdu(&services, room_alias_id, sender_user, &room_id, &state_lock)
+			.boxed()
+			.await?;
+	}
+
+	// 5. Events set by preset
+	let initial_state =
+		apply_preset_state_pdus(&services, &body, &preset, sender_user, &room_id, &state_lock)
+			.boxed()
+			.await?;
+
+	// 6. Events listed in initial_state
+	apply_initial_state_pdus(
+		&services,
+		initial_state,
+		&preset,
+		sender_user,
+		&room_id,
+		&state_lock,
+	)
+	.boxed()
+	.await?;
+
+	// 7. Events implied by name and topic
+	apply_name_and_topic_pdus(&services, &body, sender_user, &room_id, &state_lock)
+		.boxed()
+		.await?;
+
+	drop(next_count);
+	drop(state_lock);
+
+	// if inviting anyone with room creation and invite check passes
+	if (!body.invite.is_empty() || !body.invite_3pid.is_empty())
+		&& invite_check(&services, sender_user, &room_id)
+			.await
+			.is_ok()
+	{
+		process_invites(&services, &body, sender_user, &room_id)
+			.boxed()
+			.await;
+	}
+
+	finalize_alias_and_directory(&services, &body, alias.as_deref(), sender_user, &room_id)
+		.await?;
+
+	info!("{sender_user} created a room with room ID {room_id}");
+
+	Ok(create_room::v3::Response::new(room_id))
+}
+
+async fn apply_creator_join_pdu(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
 	services
 		.timeline
 		.build_and_append_pdu(
@@ -124,53 +193,29 @@ pub(crate) async fn create_room_route(
 				..RoomMemberEventContent::new(MembershipState::Join)
 			}),
 			sender_user,
-			&room_id,
-			&state_lock,
+			room_id,
+			state_lock,
 		)
-		.boxed()
-		.await?;
+		.await
+		.map(|_| ())
+}
 
-	// 3. Power levels
-	let mut users = if !version_rules
-		.authorization
-		.explicitly_privilege_room_creators
-	{
-		BTreeMap::from_iter([(sender_user.to_owned(), int!(100))])
-	} else {
-		BTreeMap::new()
-	};
-
-	if preset == RoomPreset::TrustedPrivateChat {
-		for invite in &body.invite {
-			if services
-				.users
-				.user_is_ignored(sender_user, invite)
-				.await
-			{
-				continue;
-			} else if services
-				.users
-				.user_is_ignored(invite, sender_user)
-				.await
-			{
-				// silently drop the invite to the recipient if they've been ignored by the
-				// sender, pretend it worked
-				continue;
-			}
-
-			if !version_rules
-				.authorization
-				.additional_room_creators
-			{
-				users.insert(invite.clone(), int!(100));
-			}
-		}
-	}
+async fn apply_power_levels_pdu(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	preset: &RoomPreset,
+	version_rules: &RoomVersionRules,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	let users =
+		build_power_levels_users(services, body, preset, version_rules, sender_user).await;
 
 	let power_levels_content = default_power_levels_content(
-		&version_rules,
+		version_rules,
 		body.power_level_content_override.as_ref(),
-		&body.visibility,
+		preset,
 		users,
 	)?;
 
@@ -184,165 +229,231 @@ pub(crate) async fn create_room_route(
 				..Default::default()
 			},
 			sender_user,
-			&room_id,
-			&state_lock,
+			room_id,
+			state_lock,
 		)
-		.boxed()
-		.await?;
+		.await
+		.map(|_| ())
+}
 
-	// 4. Canonical room alias
-	if let Some(room_alias_id) = &alias {
-		services
-			.timeline
-			.build_and_append_pdu(
-				PduBuilder::state(String::new(), &RoomCanonicalAliasEventContent {
-					alias: Some(room_alias_id.to_owned()),
-					alt_aliases: vec![],
-				}),
-				sender_user,
-				&room_id,
-				&state_lock,
-			)
-			.boxed()
-			.await?;
+async fn build_power_levels_users(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	preset: &RoomPreset,
+	version_rules: &RoomVersionRules,
+	sender_user: &UserId,
+) -> BTreeMap<OwnedUserId, Int> {
+	let seed = version_rules
+		.authorization
+		.explicitly_privilege_room_creators
+		.or(|| (sender_user.to_owned(), int!(100)))
+		.into_iter()
+		.collect::<BTreeMap<_, _>>();
+
+	let trusted_invitees = *preset == RoomPreset::TrustedPrivateChat
+		&& !version_rules
+			.authorization
+			.additional_room_creators;
+
+	if !trusted_invitees {
+		return seed;
 	}
 
-	// 5. Events set by preset
+	body.invite
+		.iter()
+		.stream()
+		.filter(|&invite| invite_allowed(services, sender_user, invite))
+		.ready_fold(seed, |mut users, invite| {
+			users.insert(invite.clone(), int!(100));
+			users
+		})
+		.await
+}
+
+async fn apply_canonical_alias_pdu(
+	services: &Services,
+	room_alias_id: &RoomAliasId,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder::state(String::new(), &RoomCanonicalAliasEventContent {
+				alias: Some(room_alias_id.to_owned()),
+				alt_aliases: vec![],
+			}),
+			sender_user,
+			room_id,
+			state_lock,
+		)
+		.await
+		.map(|_| ())
+}
+
+async fn apply_preset_state_pdus(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	preset: &RoomPreset,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result<Vec<InitialEvent>> {
+	let mut initial_state = body
+		.initial_state
+		.iter()
+		.map(|state| Ok(state.deserialize_as_unchecked::<InitialEvent>()?))
+		.filter_ok(|event| {
+			services.config.allow_encryption || event.event_type != StateEventType::RoomEncryption
+		})
+		.filter_ok(|event| {
+			// client/appservice workaround: if a user sends an initial_state event with a
+			// state event in there with the content of literally `{}` (not null or empty
+			// string), let's just skip it over and warn.
+			if event.content.get() == "{}" {
+				debug_warn!("skipping empty initial state event of type {}", event.event_type);
+				false
+			} else {
+				true
+			}
+		})
+		.filter_ok(|event| body.name.is_none() || event.event_type != StateEventType::RoomName)
+		.filter_ok(|event| body.topic.is_none() || event.event_type != StateEventType::RoomTopic)
+		.collect::<Result<Vec<_>>>()?;
+
+	let join_rule_pdubuilder =
+		take_initial(&mut initial_state, &StateEventType::RoomJoinRules, "")
+			.map(Into::into)
+			.unwrap_or_else(|| {
+				PduBuilder::state(
+					String::new(),
+					&RoomJoinRulesEventContent::new(match preset {
+						| RoomPreset::PublicChat => JoinRule::Public,
+						// according to spec "invite" is the default
+						| _ => JoinRule::Invite,
+					}),
+				)
+			});
+
+	let history_visibility_pdubuilder =
+		take_initial(&mut initial_state, &StateEventType::RoomHistoryVisibility, "")
+			.map(Into::into)
+			.unwrap_or_else(|| {
+				PduBuilder::state(
+					String::new(),
+					&RoomHistoryVisibilityEventContent::new(HistoryVisibility::Shared),
+				)
+			});
+
+	let guest_access_pdubuilder =
+		take_initial(&mut initial_state, &StateEventType::RoomGuestAccess, "")
+			.map(Into::into)
+			.unwrap_or_else(|| {
+				PduBuilder::state(
+					String::new(),
+					&RoomGuestAccessEventContent::new(match preset {
+						| RoomPreset::PublicChat => GuestAccess::Forbidden,
+						| _ => GuestAccess::CanJoin,
+					}),
+				)
+			});
 
 	// 5.1 Join Rules
 	services
 		.timeline
-		.build_and_append_pdu(
-			PduBuilder::state(
-				String::new(),
-				&RoomJoinRulesEventContent::new(match preset {
-					| RoomPreset::PublicChat => JoinRule::Public,
-					// according to spec "invite" is the default
-					| _ => JoinRule::Invite,
-				}),
-			),
-			sender_user,
-			&room_id,
-			&state_lock,
-		)
+		.build_and_append_pdu(join_rule_pdubuilder, sender_user, room_id, state_lock)
 		.boxed()
 		.await?;
 
 	// 5.2 History Visibility
 	services
 		.timeline
-		.build_and_append_pdu(
-			PduBuilder::state(
-				String::new(),
-				&RoomHistoryVisibilityEventContent::new(HistoryVisibility::Shared),
-			),
-			sender_user,
-			&room_id,
-			&state_lock,
-		)
+		.build_and_append_pdu(history_visibility_pdubuilder, sender_user, room_id, state_lock)
 		.boxed()
 		.await?;
 
 	// 5.3 Guest Access
 	services
 		.timeline
-		.build_and_append_pdu(
-			PduBuilder::state(
-				String::new(),
-				&RoomGuestAccessEventContent::new(match preset {
-					| RoomPreset::PublicChat => GuestAccess::Forbidden,
-					| _ => GuestAccess::CanJoin,
-				}),
-			),
-			sender_user,
-			&room_id,
-			&state_lock,
-		)
+		.build_and_append_pdu(guest_access_pdubuilder, sender_user, room_id, state_lock)
 		.boxed()
 		.await?;
 
-	// 6. Events listed in initial_state
-	let mut is_encrypted = false;
-	for event in &body.initial_state {
-		let mut pdu_builder = event
-			.deserialize_as_unchecked::<PduBuilder>()
-			.map_err(|e| {
-				err!(Request(InvalidParam(warn!("Invalid initial state event: {e:?}"))))
-			})?;
+	Ok(initial_state)
+}
 
-		debug_info!("Room creation initial state event: {event:?}");
+async fn apply_initial_state_pdus(
+	services: &Services,
+	initial_state: Vec<InitialEvent>,
+	preset: &RoomPreset,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	let is_encrypted = initial_state
+		.iter()
+		.any(|event| event.event_type == StateEventType::RoomEncryption);
 
-		// client/appservice workaround: if a user sends an initial_state event with a
-		// state event in there with the content of literally `{}` (not null or empty
-		// string), let's just skip it over and warn.
-		if pdu_builder.content.get().eq("{}") {
-			debug_warn!("skipping empty initial state event with content of `{{}}`: {event:?}");
-			debug_warn!("content: {}", pdu_builder.content.get());
-			continue;
-		}
-
-		// Implicit state key defaults to ""
-		pdu_builder
-			.state_key
-			.get_or_insert_with(StateKey::new);
-
-		// Silently skip encryption events if they are not allowed
-		if pdu_builder.event_type == TimelineEventType::RoomEncryption
-			&& !services.config.allow_encryption
-		{
-			continue;
-		}
-
-		if pdu_builder.event_type == TimelineEventType::RoomEncryption {
-			is_encrypted = true;
-		}
-
+	for event in initial_state {
 		services
 			.timeline
-			.build_and_append_pdu(pdu_builder, sender_user, &room_id, &state_lock)
+			.build_and_append_pdu(event.into(), sender_user, room_id, state_lock)
 			.boxed()
 			.await?;
 	}
 
-	if services.config.allow_encryption && !is_encrypted {
-		use RoomPreset::*;
-
-		let config = services
-			.config
-			.encryption_enabled_by_default_for_room_type
-			.as_deref();
-
-		let should_encrypt = match config {
-			| Some("all") => true,
-			| Some("invite") => matches!(preset, PrivateChat | TrustedPrivateChat),
-			| _ => false,
-		};
-
-		if should_encrypt {
-			let algorithm = EventEncryptionAlgorithm::MegolmV1AesSha2;
-			let content = RoomEncryptionEventContent::new(algorithm);
-			services
-				.timeline
-				.build_and_append_pdu(
-					PduBuilder::state(String::new(), &content),
-					sender_user,
-					&room_id,
-					&state_lock,
-				)
-				.boxed()
-				.await?;
-		}
+	if !services.config.allow_encryption || is_encrypted {
+		return Ok(());
 	}
 
-	// 7. Events implied by name and topic
+	let config = services
+		.config
+		.encryption_enabled_by_default_for_room_type
+		.as_deref();
+
+	let should_encrypt = match config {
+		| Some("all") => true,
+		| Some("invite") =>
+			matches!(preset, RoomPreset::PrivateChat | RoomPreset::TrustedPrivateChat),
+		| _ => false,
+	};
+
+	if !should_encrypt {
+		return Ok(());
+	}
+
+	let algorithm = EventEncryptionAlgorithm::MegolmV1AesSha2;
+	let content = RoomEncryptionEventContent::new(algorithm);
+	services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder::state(String::new(), &content),
+			sender_user,
+			room_id,
+			state_lock,
+		)
+		.boxed()
+		.await?;
+
+	Ok(())
+}
+
+async fn apply_name_and_topic_pdus(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
 	if let Some(name) = &body.name {
 		services
 			.timeline
 			.build_and_append_pdu(
 				PduBuilder::state(String::new(), &RoomNameEventContent::new(name.clone())),
 				sender_user,
-				&room_id,
-				&state_lock,
+				room_id,
+				state_lock,
 			)
 			.boxed()
 			.await?;
@@ -352,81 +463,80 @@ pub(crate) async fn create_room_route(
 		services
 			.timeline
 			.build_and_append_pdu(
-				PduBuilder::state(String::new(), &RoomTopicEventContent {
-					topic: topic.clone(),
-					topic_block: TopicContentBlock::default(),
-				}),
+				PduBuilder::state(String::new(), &RoomTopicEventContent::new(topic.clone())),
 				sender_user,
-				&room_id,
-				&state_lock,
+				room_id,
+				state_lock,
 			)
 			.boxed()
 			.await?;
 	}
 
-	drop(next_count);
-	drop(state_lock);
+	Ok(())
+}
 
-	// if inviting anyone with room creation and invite check passes
-	if (!body.invite.is_empty() || !body.invite_3pid.is_empty())
-		&& invite_check(&services, sender_user, &room_id)
-			.await
-			.is_ok()
-	{
-		// 8. Events implied by invite (and TODO: invite_3pid)
-		for user_id in &body.invite {
-			if services
-				.users
-				.user_is_ignored(sender_user, user_id)
-				.await
-			{
-				continue;
-			} else if services
-				.users
-				.user_is_ignored(user_id, sender_user)
-				.await
-			{
-				// silently drop the invite to the recipient if they've been ignored by the
-				// sender, pretend it worked
-				continue;
-			}
-
+async fn process_invites(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	sender_user: &UserId,
+	room_id: &RoomId,
+) {
+	// 8. Events implied by invite (and TODO: invite_3pid)
+	body.invite
+		.iter()
+		.stream()
+		.filter(|&user_id| invite_allowed(services, sender_user, user_id))
+		.for_each(|user_id| async {
 			if let Err(e) = services
 				.membership
-				.invite(sender_user, user_id, &room_id, None, body.is_direct)
+				.invite(sender_user, user_id, room_id, None, body.is_direct)
 				.boxed()
 				.await
 			{
 				warn!(%e, "Failed to send invite");
 			}
-		}
-	}
+		})
+		.await;
+}
 
-	// Homeserver specific stuff
+/// Gate an invitee against the sender's ignore list, the recipient's ignore
+/// list, and MSC4380 `m.invite_permission_config`.
+async fn invite_allowed(services: &Services, sender_user: &UserId, invitee: &UserId) -> bool {
+	!(services
+		.users
+		.user_is_ignored(sender_user, invitee)
+		.await || services
+		.users
+		.user_is_ignored(invitee, sender_user)
+		.await || services.users.invites_blocked(invitee).await)
+}
+
+async fn finalize_alias_and_directory(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	alias: Option<&RoomAliasId>,
+	sender_user: &UserId,
+	room_id: &RoomId,
+) -> Result {
 	if let Some(alias) = alias {
 		services
 			.alias
-			.set_alias_by(&alias, &room_id, sender_user)?;
+			.set_alias_by(alias, room_id, sender_user)?;
 	}
 
 	if body.visibility == room::Visibility::Public {
-		services.directory.set_public(&room_id);
+		services.directory.set_public(room_id);
 
 		if services.server.config.admin_room_notices {
 			services
 				.admin
-				.send_text(&format!(
-					"{sender_user} made {} public to the room directory",
-					&room_id
-				))
+				.send_text(&format!("{sender_user} made {room_id} public to the room directory"))
 				.await;
 		}
-		info!("{sender_user} made {0} public to the room directory", &room_id);
+		info!("{sender_user} made {0} public to the room directory", room_id);
 	}
 
-	info!("{sender_user} created a room with room ID {room_id}");
-
-	Ok(create_room::v3::Response::new(room_id))
+	Ok(())
 }
 
 async fn create_create_event(
@@ -639,8 +749,8 @@ async fn create_create_event_legacy(
 /// creates the power_levels_content for the PDU builder
 fn default_power_levels_content(
 	version_rules: &RoomVersionRules,
-	power_level_content_override: Option<&Raw<RoomPowerLevelsEventContent>>,
-	visibility: &room::Visibility,
+	power_level_content_override: Option<&Raw<RoomPowerLevelsContentOverride>>,
+	preset: &RoomPreset,
 	users: BTreeMap<OwnedUserId, Int>,
 ) -> Result<serde_json::Value> {
 	use serde_json::to_value;
@@ -652,33 +762,34 @@ fn default_power_levels_content(
 
 	// secure proper defaults of sensitive/dangerous permissions that moderators
 	// (power level 50) should not have easy access to
-	power_levels_content["events"]["m.room.power_levels"] = to_value(100)?;
-	power_levels_content["events"]["m.room.server_acl"] = to_value(100)?;
-	power_levels_content["events"]["m.room.encryption"] = to_value(100)?;
-	power_levels_content["events"]["m.room.history_visibility"] = to_value(100)?;
+	power_levels_content["events"]["m.room.power_levels"] = json!(100);
+	power_levels_content["events"]["m.room.server_acl"] = json!(100);
+	power_levels_content["events"]["m.room.encryption"] = json!(100);
+	power_levels_content["events"]["m.room.history_visibility"] = json!(100);
 
 	if version_rules
 		.authorization
 		.explicitly_privilege_room_creators
 	{
-		power_levels_content["events"]["m.room.tombstone"] = to_value(150)?;
+		power_levels_content["events"]["m.room.tombstone"] = json!(150);
 	} else {
-		power_levels_content["events"]["m.room.tombstone"] = to_value(100)?;
+		power_levels_content["events"]["m.room.tombstone"] = json!(100);
 	}
 
 	// always allow users to respond (not post new) to polls. this is primarily
 	// useful in read-only announcement rooms that post a public poll.
-	power_levels_content["events"]["org.matrix.msc3381.poll.response"] = to_value(0)?;
-	power_levels_content["events"]["m.poll.response"] = to_value(0)?;
+	power_levels_content["events"]["org.matrix.msc3381.poll.response"] = json!(0);
+	power_levels_content["events"]["m.poll.response"] = json!(0);
 
-	// synapse does this too. clients do not expose these permissions. it prevents
-	// default users from calling public rooms, for obvious reasons.
-	if *visibility == room::Visibility::Public {
-		power_levels_content["events"]["m.call.invite"] = to_value(50)?;
-		power_levels_content["events"]["m.call"] = to_value(50)?;
-		power_levels_content["events"]["m.call.member"] = to_value(50)?;
-		power_levels_content["events"]["org.matrix.msc3401.call"] = to_value(50)?;
-		power_levels_content["events"]["org.matrix.msc3401.call.member"] = to_value(50)?;
+	// public_chat: pin invite and call-setup events at PL 50. Synapse pins
+	// invite and m.call.invite here; the MSC3401 entries are tuwunel-only.
+	if *preset == RoomPreset::PublicChat {
+		power_levels_content["invite"] = json!(50);
+		power_levels_content["events"]["m.call.invite"] = json!(50);
+		power_levels_content["events"]["m.call"] = json!(50);
+		power_levels_content["events"]["m.call.member"] = json!(50);
+		power_levels_content["events"]["org.matrix.msc3401.call"] = json!(50);
+		power_levels_content["events"]["org.matrix.msc3401.call.member"] = json!(50);
 	}
 
 	if let Some(power_level_content_override) = power_level_content_override {
@@ -847,4 +958,38 @@ async fn can_create_room_check(
 	}
 
 	Ok(())
+}
+
+#[derive(Deserialize)]
+struct InitialEvent {
+	#[serde(rename = "type")]
+	event_type: StateEventType,
+
+	#[serde(default = "StateKey::new")]
+	state_key: StateKey,
+
+	content: Box<RawValue>,
+}
+
+impl From<InitialEvent> for PduBuilder {
+	fn from(value: InitialEvent) -> Self {
+		Self {
+			event_type: value.event_type.into(),
+			content: value.content,
+			unsigned: None,
+			state_key: Some(value.state_key),
+			redacts: None,
+			timestamp: None,
+		}
+	}
+}
+
+fn take_initial(
+	initial_state: &mut Vec<InitialEvent>,
+	event_type: &StateEventType,
+	state_key: &str,
+) -> Option<InitialEvent> {
+	initial_state
+		.extract_if(.., |event| &event.event_type == event_type && event.state_key == state_key)
+		.next()
 }

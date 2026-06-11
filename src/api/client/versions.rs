@@ -1,7 +1,11 @@
 use std::iter::once;
 
-use ruma::api::client::discovery::get_supported_versions;
-use tuwunel_core::Result;
+use ruma::api::client::discovery::get_supported_versions::{self, Server};
+use tuwunel_core::{
+	Result,
+	info::rustc::version as rustc_version,
+	version::{name as package_name, version as package_version},
+};
 
 use crate::Ruma;
 
@@ -20,6 +24,12 @@ use crate::Ruma;
 pub(crate) async fn get_supported_versions_route(
 	_body: Ruma<get_supported_versions::Request>,
 ) -> Result<get_supported_versions::Response> {
+	// MSC4383: client-side parity with /_matrix/federation/v1/version.
+	let server = Server {
+		compiler: rustc_version().map(Into::into),
+		..Server::new(package_name().into(), package_version().into())
+	};
+
 	Ok(get_supported_versions::Response {
 		versions: VERSIONS.into_iter().map(Into::into).collect(),
 
@@ -28,10 +38,12 @@ pub(crate) async fn get_supported_versions_route(
 			.map(Into::into)
 			.zip(once(true).cycle())
 			.collect(),
+
+		server: Some(server),
 	})
 }
 
-static VERSIONS: [&str; 17] = [
+static VERSIONS: [&str; 25] = [
 	"r0.0.1", /* Historical */
 	"r0.1.0", /* Historical */
 	"r0.2.0", /* Historical */
@@ -43,15 +55,23 @@ static VERSIONS: [&str; 17] = [
 	"v1.1",   /* Stable; Tested */
 	"v1.2",   /* Stable; Tested */
 	"v1.3",   /* Stable; Tested */
-	"v1.4",   /* Stable; Tested */
+	"v1.4",   /* Tested; private read receipts, threads */
 	"v1.5",   /* Stable; Tested */
+	"v1.6",   /* jump to date (element-web labs gate) */
+	"v1.7",   /* intentional mentions */
+	"v1.8",   /* no action */
+	"v1.9",   /* no action */
 	"v1.10",  /* Tested; relations recursion */
 	"v1.11",  /* Tested; authenticated media */
-	"v1.12",  /* m.tz */
-	"v1.15",  /* custom profile fields */
+	"v1.12",  /* no action */
+	"v1.13",  /* no action */
+	"v1.14",  /* no action */
+	"v1.15",  /* OIDC auth metadata */
+	"v1.16",  /* extended profiles (MSC4133) */
+	"v1.17",  /* no action */
 ];
 
-static UNSTABLE_FEATURES: [&str; 18] = [
+static UNSTABLE_FEATURES: [&str; 35] = [
 	"org.matrix.e2e_cross_signing",
 	// private read receipts (https://github.com/matrix-org/matrix-spec-proposals/pull/2285)
 	"org.matrix.msc2285.stable",
@@ -61,6 +81,8 @@ static UNSTABLE_FEATURES: [&str; 18] = [
 	"uk.half-shot.msc2666.query_mutual_rooms",
 	// threading/threads (https://github.com/matrix-org/matrix-spec-proposals/pull/2836)
 	"org.matrix.msc2836",
+	// jump to date (https://github.com/matrix-org/matrix-spec-proposals/pull/3030)
+	"org.matrix.msc3030",
 	// spaces/hierarchy summaries (https://github.com/matrix-org/matrix-spec-proposals/pull/2946)
 	"org.matrix.msc2946",
 	// busy presence status (https://github.com/matrix-org/matrix-spec-proposals/pull/3026)
@@ -76,14 +98,44 @@ static UNSTABLE_FEATURES: [&str; 18] = [
 	"org.matrix.msc3916.stable",
 	// intentional mentions (https://github.com/matrix-org/matrix-spec-proposals/pull/3952)
 	"org.matrix.msc3952_intentional_mentions",
-	// Extending User Profile API with Key:Value Pairs (https://github.com/matrix-org/matrix-spec-proposals/pull/4133)
+	// MSC4133 (custom profile fields) and MSC4175 (m.tz) stabilized in
+	// Matrix 1.16; advertise the historical unstable prefixes alongside
+	// the post-merge `.stable` flags for clients that haven't migrated.
 	"uk.tcpip.msc4133",
-	// Profile field for user time zone (https://github.com/matrix-org/matrix-spec-proposals/pull/4175)
+	"uk.tcpip.msc4133.stable",
 	"us.cloke.msc4175",
+	"us.cloke.msc4175.stable",
 	// stable flag for 3916 (https://github.com/matrix-org/matrix-spec-proposals/pull/4180)
 	"org.matrix.msc4180",
 	// Simplified Sliding sync (https://github.com/matrix-org/matrix-spec-proposals/pull/4186)
 	"org.matrix.simplified_msc3575",
 	// Allow room moderators to view redacted event content (https://github.com/matrix-org/matrix-spec-proposals/pull/2815)
 	"fi.mau.msc2815",
+	// OIDC-native auth umbrella (https://github.com/matrix-org/matrix-spec-proposals/pull/3861)
+	"org.matrix.msc3861",
+	// OIDC-native auth: authorization code grant (https://github.com/matrix-org/matrix-spec-proposals/pull/2964)
+	"org.matrix.msc2964",
+	// OIDC-native auth: auth issuer discovery (https://github.com/matrix-org/matrix-spec-proposals/pull/2965)
+	"org.matrix.msc2965",
+	// OIDC-native auth: dynamic client registration (https://github.com/matrix-org/matrix-spec-proposals/pull/2966)
+	"org.matrix.msc2966",
+	// OIDC-native auth: API scopes (https://github.com/matrix-org/matrix-spec-proposals/pull/2967)
+	"org.matrix.msc2967",
+	// OIDC delegation aware
+	"org.matrix.msc3824",
+	// Backwards-compatible redaction sending via /send (https://github.com/matrix-org/matrix-spec-proposals/pull/4169)
+	"com.beeper.msc4169",
+	// Invite blocking via m.invite_permission_config (https://github.com/matrix-org/matrix-spec-proposals/pull/4380)
+	"org.matrix.msc4380",
+	"org.matrix.msc4380.stable",
+	// Client-server discovery of server version (https://github.com/matrix-org/matrix-spec-proposals/pull/4383)
+	"net.zemos.msc4383",
+	// Policy servers (https://github.com/matrix-org/matrix-spec-proposals/pull/4284)
+	"org.matrix.msc4284",
+	// Read receipts for threads (https://github.com/matrix-org/matrix-spec-proposals/pull/3771)
+	"org.matrix.msc3771",
+	// Notifications for threads (https://github.com/matrix-org/matrix-spec-proposals/pull/3773)
+	"org.matrix.msc3773",
+	// state_after on /sync (https://github.com/matrix-org/matrix-spec-proposals/pull/4222)
+	"org.matrix.msc4222",
 ];

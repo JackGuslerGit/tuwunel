@@ -43,10 +43,17 @@ macro_rules! Err {
 #[macro_export]
 #[collapse_debuginfo(yes)]
 macro_rules! err {
+	(HttpJson($statuscode:ident, $($args:tt)+)) => {
+		$crate::error::Error::HttpJson(
+			$crate::http::StatusCode::$statuscode,
+			::axum::Json(::serde_json::json!($($args)+))
+		)
+	};
+
 	(Request(Forbidden($level:ident!($($args:tt)+)))) => {{
 		let mut buf = String::new();
 		$crate::error::Error::Request(
-			$crate::ruma::api::client::error::ErrorKind::forbidden(),
+			$crate::ruma::api::error::ErrorKind::forbidden(),
 			$crate::err_log!(buf, $level, $($args)+),
 			$crate::http::StatusCode::BAD_REQUEST
 		)
@@ -54,7 +61,7 @@ macro_rules! err {
 
 	(Request(Forbidden($($args:tt)+))) => {
 		$crate::error::Error::Request(
-			$crate::ruma::api::client::error::ErrorKind::forbidden(),
+			$crate::ruma::api::error::ErrorKind::forbidden(),
 			$crate::format_maybe!($($args)+),
 			$crate::http::StatusCode::BAD_REQUEST
 		)
@@ -63,7 +70,7 @@ macro_rules! err {
 	(Request($variant:ident($level:ident!($($args:tt)+)))) => {{
 		let mut buf = String::new();
 		$crate::error::Error::Request(
-			$crate::ruma::api::client::error::ErrorKind::$variant,
+			$crate::ruma::api::error::ErrorKind::$variant,
 			$crate::err_log!(buf, $level, $($args)+),
 			$crate::http::StatusCode::BAD_REQUEST
 		)
@@ -71,7 +78,7 @@ macro_rules! err {
 
 	(Request($variant:ident($($args:tt)+))) => {
 		$crate::error::Error::Request(
-			$crate::ruma::api::client::error::ErrorKind::$variant,
+			$crate::ruma::api::error::ErrorKind::$variant,
 			$crate::format_maybe!($($args)+),
 			$crate::http::StatusCode::BAD_REQUEST
 		)
@@ -133,7 +140,13 @@ macro_rules! err_log {
 			fields: $($fields)+,
 		};
 
-		($crate::error::visit)(&mut $out, LEVEL, &__CALLSITE, &mut valueset!(__CALLSITE.metadata().fields(), $($fields)+));
+		($crate::error::visit)(
+			&mut $out,
+			LEVEL,
+			&__CALLSITE,
+			&mut valueset!(__CALLSITE.metadata().fields(), $($fields)+)
+		);
+
 		($out).into()
 	}}
 }
@@ -180,10 +193,11 @@ struct Visitor<'a>(&'a mut String);
 impl Visit for Visitor<'_> {
 	#[inline]
 	fn record_debug(&mut self, field: &Field, val: &dyn fmt::Debug) {
-		if field.name() == "message" {
-			write!(self.0, "{val:?}").expect("stream error");
-		} else {
-			write!(self.0, " {}={val:?}", field.name()).expect("stream error");
+		match field.name() {
+			| "message" => write!(self.0, "{val:?}").expect("stream error"),
+			// already named in Error::Config Display; suppress the duplicate field here.
+			| "config" => {},
+			| name => write!(self.0, " {name}={val:?}").expect("stream error"),
 		}
 	}
 }

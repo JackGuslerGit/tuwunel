@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value as JsonValue, value::RawValue as RawJsonValue};
 
 pub use self::{
-	filter::Matches,
+	filter::{Matches, trim_event_fields},
 	id::*,
 	relation::RelationTypeEqual,
 	state_key::{StateKey, TypeStateKey},
@@ -184,7 +184,7 @@ pub trait Event: Clone + Debug + Send + Sync {
 	/// If this event is a redaction event this is the event it redacts.
 	fn redacts(&self) -> Option<&EventId>;
 
-	/// see: https://spec.matrix.org/v1.14/rooms/v11/#rejected-events
+	/// see: <https://spec.matrix.org/v1.14/rooms/v11/#rejected-events>
 	fn rejected(&self) -> bool;
 
 	/// The `RoomId` of this event.

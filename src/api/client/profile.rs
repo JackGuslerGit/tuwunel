@@ -6,18 +6,50 @@ use futures::{
 	future::{join, join4},
 };
 use ruma::{
-	OwnedRoomId,
+	MxcUri, OwnedRoomId,
 	api::{
 		client::profile::{
-			get_avatar_url, get_display_name, get_profile, set_avatar_url, set_display_name,
+			PropagateTo, get_avatar_url, get_display_name, get_profile, set_avatar_url,
+			set_display_name,
 		},
-		federation,
+		federation::query::get_profile_information,
 	},
 	presence::PresenceState,
 };
+use serde_json::Value as JsonValue;
 use tuwunel_core::{Err, Result, utils::future::TryExtExt};
+use tuwunel_service::users::{Propagation, propagation_default};
 
-use crate::Ruma;
+use crate::{ClientIp, Ruma};
+
+pub(super) type ProfileResponse = get_profile_information::v1::Response;
+
+/// Pull a string field out of a federation profile-info response. The body
+/// shape switched from explicit fields to a flat `BTreeMap<String, JsonValue>`
+/// once extended profile fields stabilised.
+pub(super) fn profile_str<'a>(resp: &'a ProfileResponse, field: &str) -> Option<&'a str> {
+	resp.get(field).and_then(JsonValue::as_str)
+}
+
+pub(super) fn profile_mxc<'a>(resp: &'a ProfileResponse, field: &str) -> Option<&'a MxcUri> {
+	profile_str(resp, field).map(<&MxcUri>::from)
+}
+
+/// Resolve a `PropagateTo` request value against the server default.
+///
+/// MSC4466's `_Custom` variant is treated as the server default so
+/// unknown values do not silently change behavior.
+pub(super) fn resolve_propagation(
+	propagate_to: &PropagateTo,
+	server_default: Propagation,
+) -> Propagation {
+	match propagate_to {
+		| PropagateTo::All => Propagation::All,
+		| PropagateTo::Unchanged => Propagation::Unchanged,
+		| PropagateTo::None => Propagation::None,
+		| _ => server_default,
+	}
+}
 
 /// # `PUT /_matrix/client/r0/profile/{userId}/displayname`
 ///
@@ -26,6 +58,7 @@ use crate::Ruma;
 /// - Also makes sure other users receive the update using presence EDUs
 pub(crate) async fn set_displayname_route(
 	State(services): State<crate::State>,
+	ClientIp(client): ClientIp,
 	body: Ruma<set_display_name::v3::Request>,
 ) -> Result<set_display_name::v3::Response> {
 	let sender_user = body.sender_user();
@@ -41,15 +74,35 @@ pub(crate) async fn set_displayname_route(
 		.collect()
 		.await;
 
+	let propagation = resolve_propagation(
+		&body.propagate_to,
+		propagation_default(
+			services
+				.server
+				.config
+				.preserve_room_profile_overrides,
+		),
+	);
+
 	services
 		.users
-		.update_displayname(&body.user_id, body.displayname.as_deref(), &all_joined_rooms)
+		.update_displayname(
+			&body.user_id,
+			body.displayname.as_deref(),
+			&all_joined_rooms,
+			propagation,
+		)
 		.await;
 
 	// Presence update
 	services
 		.presence
-		.maybe_ping_presence(&body.user_id, body.sender_device.as_deref(), &PresenceState::Online)
+		.maybe_ping_presence(
+			&body.user_id,
+			body.sender_device.as_deref(),
+			Some(client),
+			&PresenceState::Online,
+		)
 		.await?;
 
 	Ok(set_display_name::v3::Response {})
@@ -69,13 +122,10 @@ pub(crate) async fn get_displayname_route(
 		// Create and update our local copy of the user
 		if let Ok(response) = services
 			.federation
-			.execute(
-				body.user_id.server_name(),
-				federation::query::get_profile_information::v1::Request {
-					user_id: body.user_id.clone(),
-					field: None, // we want the full user's profile to update locally too
-				},
-			)
+			.execute(body.user_id.server_name(), get_profile_information::v1::Request {
+				user_id: body.user_id.clone(),
+				field: None, // we want the full user's profile to update locally too
+			})
 			.await
 		{
 			if !services.users.exists(&body.user_id).await {
@@ -85,17 +135,20 @@ pub(crate) async fn get_displayname_route(
 					.await?;
 			}
 
+			let displayname = profile_str(&response, "displayname");
 			services
 				.users
-				.set_displayname(&body.user_id, response.displayname.as_deref());
+				.set_displayname(&body.user_id, displayname);
 			services
 				.users
-				.set_avatar_url(&body.user_id, response.avatar_url.as_deref());
+				.set_avatar_url(&body.user_id, profile_mxc(&response, "avatar_url"));
 			services
 				.users
-				.set_blurhash(&body.user_id, response.blurhash.as_deref());
+				.set_blurhash(&body.user_id, profile_str(&response, "blurhash"));
 
-			return Ok(get_display_name::v3::Response { displayname: response.displayname });
+			return Ok(get_display_name::v3::Response {
+				displayname: displayname.map(str::to_owned),
+			});
 		}
 	}
 
@@ -121,6 +174,7 @@ pub(crate) async fn get_displayname_route(
 /// - Also makes sure other users receive the update using presence EDUs
 pub(crate) async fn set_avatar_url_route(
 	State(services): State<crate::State>,
+	ClientIp(client): ClientIp,
 	body: Ruma<set_avatar_url::v3::Request>,
 ) -> Result<set_avatar_url::v3::Response> {
 	let sender_user = body.sender_user();
@@ -136,6 +190,16 @@ pub(crate) async fn set_avatar_url_route(
 		.collect()
 		.await;
 
+	let propagation = resolve_propagation(
+		&body.propagate_to,
+		propagation_default(
+			services
+				.server
+				.config
+				.preserve_room_profile_overrides,
+		),
+	);
+
 	services
 		.users
 		.update_avatar_url(
@@ -143,13 +207,19 @@ pub(crate) async fn set_avatar_url_route(
 			body.avatar_url.as_deref(),
 			body.blurhash.as_deref(),
 			&all_joined_rooms,
+			propagation,
 		)
 		.await;
 
 	// Presence update
 	services
 		.presence
-		.maybe_ping_presence(&body.user_id, body.sender_device.as_deref(), &PresenceState::Online)
+		.maybe_ping_presence(
+			&body.user_id,
+			body.sender_device.as_deref(),
+			Some(client),
+			&PresenceState::Online,
+		)
 		.await
 		.ok();
 
@@ -170,13 +240,10 @@ pub(crate) async fn get_avatar_url_route(
 		// Create and update our local copy of the user
 		if let Ok(response) = services
 			.federation
-			.execute(
-				body.user_id.server_name(),
-				federation::query::get_profile_information::v1::Request {
-					user_id: body.user_id.clone(),
-					field: None, // we want the full user's profile to update locally as well
-				},
-			)
+			.execute(body.user_id.server_name(), get_profile_information::v1::Request {
+				user_id: body.user_id.clone(),
+				field: None, // we want the full user's profile to update locally as well
+			})
 			.await
 		{
 			if !services.users.exists(&body.user_id).await {
@@ -186,19 +253,21 @@ pub(crate) async fn get_avatar_url_route(
 					.await?;
 			}
 
+			let avatar_url = profile_mxc(&response, "avatar_url");
+			let blurhash = profile_str(&response, "blurhash");
 			services
 				.users
-				.set_displayname(&body.user_id, response.displayname.as_deref());
+				.set_displayname(&body.user_id, profile_str(&response, "displayname"));
 			services
 				.users
-				.set_avatar_url(&body.user_id, response.avatar_url.as_deref());
+				.set_avatar_url(&body.user_id, avatar_url);
 			services
 				.users
-				.set_blurhash(&body.user_id, response.blurhash.as_deref());
+				.set_blurhash(&body.user_id, blurhash);
 
 			return Ok(get_avatar_url::v3::Response {
-				avatar_url: response.avatar_url,
-				blurhash: response.blurhash,
+				avatar_url: avatar_url.map(ToOwned::to_owned),
+				blurhash: blurhash.map(str::to_owned),
 			});
 		}
 	}
@@ -228,17 +297,22 @@ pub(crate) async fn get_profile_route(
 	State(services): State<crate::State>,
 	body: Ruma<get_profile::v3::Request>,
 ) -> Result<get_profile::v3::Response> {
-	if !services.globals.user_is_local(&body.user_id) {
+	const CANONICAL_FIELDS: &[&str] = &["avatar_url", "blurhash", "displayname", "m.tz"];
+
+	let is_local = services.globals.user_is_local(&body.user_id);
+	let allow_outbound = services
+		.server
+		.config
+		.allow_outbound_profile_lookup_federation_requests;
+
+	if !is_local && allow_outbound {
 		// Create and update our local copy of the user
 		if let Ok(response) = services
 			.federation
-			.execute(
-				body.user_id.server_name(),
-				federation::query::get_profile_information::v1::Request {
-					user_id: body.user_id.clone(),
-					field: None,
-				},
-			)
+			.execute(body.user_id.server_name(), get_profile_information::v1::Request {
+				user_id: body.user_id.clone(),
+				field: None,
+			})
 			.await
 		{
 			if !services.users.exists(&body.user_id).await {
@@ -250,43 +324,41 @@ pub(crate) async fn get_profile_route(
 
 			services
 				.users
-				.set_displayname(&body.user_id, response.displayname.as_deref());
+				.set_displayname(&body.user_id, profile_str(&response, "displayname"));
 			services
 				.users
-				.set_avatar_url(&body.user_id, response.avatar_url.as_deref());
+				.set_avatar_url(&body.user_id, profile_mxc(&response, "avatar_url"));
 			services
 				.users
-				.set_blurhash(&body.user_id, response.blurhash.as_deref());
+				.set_blurhash(&body.user_id, profile_str(&response, "blurhash"));
 			services
 				.users
-				.set_timezone(&body.user_id, response.tz.as_deref());
+				.set_timezone(&body.user_id, profile_str(&response, "m.tz"));
 
-			for (profile_key, profile_key_value) in &response.custom_profile_fields {
-				services.users.set_profile_key(
-					&body.user_id,
-					profile_key,
-					Some(profile_key_value),
-				);
+			for (key, value) in response.iter() {
+				if CANONICAL_FIELDS.contains(&key.as_str()) {
+					continue;
+				}
+				services
+					.users
+					.set_profile_key(&body.user_id, key, Some(value));
 			}
 
-			let canonical_fields = [
-				("avatar_url", response.avatar_url.map(Into::into)),
-				("blurhash", response.blurhash),
-				("displayname", response.displayname),
-				("m.tz", response.tz),
-			];
-
-			let response = canonical_fields
-				.into_iter()
-				.filter_map(|(key, val)| val.map(|val| (key, val)))
-				.map(|(key, val)| (key.to_owned(), val.into()))
-				.chain(response.custom_profile_fields);
-
-			return Ok(response.collect::<get_profile::v3::Response>());
+			return Ok(response
+				.iter()
+				.map(|(key, val)| (key.clone(), val.clone()))
+				.collect::<get_profile::v3::Response>());
 		}
 	}
 
 	if !services.users.exists(&body.user_id).await {
+		if !is_local && !allow_outbound {
+			// MSC3550: signal a withheld profile, not a missing user.
+			return Err!(Request(Forbidden(
+				"Profile lookup over federation is not allowed on this homeserver."
+			)));
+		}
+
 		// Return 404 if this user doesn't exist and we couldn't fetch it over
 		// federation
 		return Err!(Request(NotFound("Profile was not found.")));

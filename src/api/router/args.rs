@@ -1,4 +1,4 @@
-use std::{fmt::Debug, mem, ops::Deref};
+use std::{any::TypeId, fmt::Debug, mem, ops::Deref};
 
 use axum::{body::Body, extract::FromRequest};
 use axum_extra::extract::cookie::CookieJar;
@@ -10,7 +10,12 @@ use ruma::{
 use tuwunel_core::{Error, Result, debug_warn, err, trace, utils::string::EMPTY};
 use tuwunel_service::{Services, appservice::RegistrationInfo};
 
-use super::{auth, auth::Auth, request, request::Request};
+use super::{
+	auth,
+	auth::{Auth, AuthDispatch},
+	request,
+	request::Request,
+};
 use crate::State;
 
 /// Extractor for Ruma request structs
@@ -78,6 +83,7 @@ where
 impl<T> FromRequest<State, Body> for Args<T>
 where
 	T: IncomingRequest + Debug + Send + Sync + 'static,
+	T::Authentication: AuthDispatch,
 {
 	type Rejection = Error;
 
@@ -89,7 +95,7 @@ where
 		ret(level = "trace"),
 	)]
 	async fn from_request(
-		request: hyper::Request<Body>,
+		request: http::Request<Body>,
 		services: &State,
 	) -> Result<Self, Self::Rejection> {
 		let mut request = request::from(services, request).await?;
@@ -111,7 +117,14 @@ where
 			json_body = Some(CanonicalJsonValue::Object(CanonicalJsonObject::new()));
 		}
 
-		let auth = auth::auth(services, &mut request, json_body.as_ref(), &T::METADATA).await?;
+		let auth = auth::auth::<T::Authentication>(
+			services,
+			&mut request,
+			json_body.as_ref(),
+			TypeId::of::<T>(),
+		)
+		.await?;
+
 		Ok(Self {
 			body: make_body::<T>(services, &mut request, json_body.as_mut(), &auth)?,
 			cookie: request.cookie,
@@ -139,8 +152,8 @@ where
 		.map_err(|e| err!(Request(BadJson(debug_warn!("{e}")))))
 }
 
-fn into_http_request(request: &Request, body: Bytes) -> hyper::Request<Bytes> {
-	let mut http_request = hyper::Request::builder()
+fn into_http_request(request: &Request, body: Bytes) -> http::Request<Bytes> {
+	let mut http_request = http::Request::builder()
 		.uri(request.parts.uri.clone())
 		.method(request.parts.method.clone());
 
